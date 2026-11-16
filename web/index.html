@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#15171c">
+<title>Audacious</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #15171c; --panel: #1d2027; --raised: #272b34; --line: #2f343f;
+  --text: #e8eaef; --dim: #8f97a6; --accent: #ff8a3d; --accent-text: #1a1206;
+  --danger: #ff6464; --row: 48px;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f4f5f7; --panel: #ffffff; --raised: #eceef2; --line: #dde0e6;
+    --text: #1c1f26; --dim: #6a7282; --accent: #d9600f; --accent-text: #ffffff;
+    --danger: #cc2f2f;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column; height: 100dvh;
+  background: var(--bg); color: var(--text);
+  font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+button, input { font: inherit; color: inherit; }
+button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: 0; border-radius: 8px; background: transparent; cursor: pointer;
+  padding: 8px; min-width: 38px; min-height: 38px;
+}
+button:hover { background: var(--raised); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+button:disabled { opacity: .35; cursor: default; background: transparent; }
+button.on { color: var(--accent); }
+button.danger:hover { color: var(--danger); }
+svg { width: 22px; height: 22px; fill: currentColor; flex: none; }
+
+/* ---- сейчас играет ---- */
+#now {
+  display: grid; grid-template-columns: auto 1fr; gap: 12px 16px;
+  padding: 14px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+#art {
+  width: 112px; height: 112px; border-radius: 10px; background: var(--raised);
+  display: grid; place-items: center; overflow: hidden; color: var(--dim);
+}
+#art img { width: 100%; height: 100%; object-fit: cover; }
+#art svg { width: 44px; height: 44px; }
+#meta { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+#title { font-size: 19px; font-weight: 650; overflow-wrap: anywhere; }
+#artist { color: var(--dim); overflow-wrap: anywhere; }
+#info { color: var(--dim); font-size: 12px; margin-top: 4px; }
+#seekrow {
+  grid-column: 1 / -1; display: flex; align-items: center; gap: 10px;
+  font-variant-numeric: tabular-nums; font-size: 13px; color: var(--dim);
+}
+#controls { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+#playpause { background: var(--accent); color: var(--accent-text); border-radius: 50%; width: 48px; height: 48px; }
+#playpause:hover { filter: brightness(1.1); background: var(--accent); }
+#playpause svg { width: 26px; height: 26px; }
+.spacer { flex: 1; }
+#volrow { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+#volume { width: 110px; }
+input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; margin: 0; }
+#seek { flex: 1; }
+#removecur span { font-size: 13px; }
+
+/* ---- плейлисты ---- */
+#tabs {
+  display: flex; gap: 4px; padding: 8px 12px 0; overflow-x: auto;
+  border-bottom: 1px solid var(--line); scrollbar-width: thin; flex: none;
+}
+.tab {
+  flex: none; border-radius: 8px 8px 0 0; padding: 8px 12px; min-height: 40px;
+  color: var(--dim); border-bottom: 2px solid transparent; max-width: 240px;
+}
+.tab .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab .count { font-size: 12px; opacity: .7; }
+.tab.sel { color: var(--text); border-bottom-color: var(--accent); background: var(--panel); }
+.tab svg { width: 14px; height: 14px; color: var(--accent); }
+#toolbar { display: flex; align-items: center; gap: 2px; padding: 6px 12px; flex-wrap: wrap; flex: none; }
+#toolbar button span { font-size: 13px; }
+#filter {
+  flex: 1; min-width: 140px; padding: 8px 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel);
+}
+
+/* ---- список треков ---- */
+#list { flex: 1; overflow-y: auto; position: relative; min-height: 120px; }
+#rows { position: absolute; left: 0; right: 0; top: 0; }
+.row {
+  display: flex; align-items: center; height: var(--row); padding: 0 8px 0 0;
+  border-bottom: 1px solid var(--line); cursor: pointer;
+}
+.row:hover { background: var(--panel); }
+.row .num {
+  width: 56px; flex: none; text-align: right; padding-right: 12px; color: var(--dim);
+  font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.row .text { flex: 1; min-width: 0; }
+.row .t, .row .a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .a { color: var(--dim); font-size: 12px; }
+.row .len { flex: none; color: var(--dim); font-size: 12px; padding: 0 6px; font-variant-numeric: tabular-nums; }
+.row .q {
+  flex: none; font-size: 11px; font-weight: 700; color: var(--accent-text);
+  background: var(--accent); border-radius: 9px; padding: 1px 7px; margin-right: 4px;
+}
+.row button { color: var(--dim); }
+.row button svg { width: 18px; height: 18px; }
+.row.cur { background: var(--panel); box-shadow: inset 3px 0 0 var(--accent); }
+.row.cur .t { color: var(--accent); font-weight: 600; }
+.row.cur .num { color: var(--accent); }
+#empty { padding: 40px 16px; text-align: center; color: var(--dim); }
+#status { flex: none; padding: 5px 16px; font-size: 12px; color: var(--dim); border-top: 1px solid var(--line); }
+
+#toast {
+  position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%);
+  background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 16px; max-width: 90vw; opacity: 0; pointer-events: none;
+  transition: opacity .2s; box-shadow: 0 6px 24px rgba(0,0,0,.35);
+}
+#toast.show { opacity: 1; }
+#toast.err { border-color: var(--danger); }
+
+@media (max-width: 640px) {
+  #now { padding: 10px 12px; gap: 8px 12px; }
+  #art { width: 72px; height: 72px; }
+  #title { font-size: 16px; }
+  #volume { width: 80px; }
+  #toolbar button span, #removecur span { display: none; }
+  .row .num { width: 44px; padding-right: 8px; }
+}
+</style>
+</head>
+<body>
+
+<section id="now">
+  <div id="art"></div>
+  <div id="meta">
+    <div id="title">—</div>
+    <div id="artist"></div>
+    <div id="info"></div>
+  </div>
+  <div id="seekrow">
+    <span id="time">0:00</span>
+    <input id="seek" type="range" min="0" max="1" value="0" disabled aria-label="Позиция">
+    <span id="length">0:00</span>
+  </div>
+  <div id="controls">
+    <button id="prev" title="Предыдущий"></button>
+    <button id="playpause" title="Играть / пауза"></button>
+    <button id="stop" title="Стоп"></button>
+    <button id="next" title="Следующий"></button>
+    <button id="shuffle" title="Случайный порядок"></button>
+    <button id="repeat" title="Повтор"></button>
+    <button id="removecur" class="danger" title="Удалить играющий трек из плейлиста"><span>Убрать текущий</span></button>
+    <span class="spacer"></span>
+    <label id="volrow" title="Громкость">
+      <input id="volume" type="range" min="0" max="100" value="0" aria-label="Громкость">
+    </label>
+  </div>
+</section>
+
+<nav id="tabs"></nav>
+
+<div id="toolbar">
+  <button id="plplay" title="Играть этот плейлист"><span>Играть</span></button>
+  <button id="locate" title="Показать текущий трек"><span>К текущему</span></button>
+  <button id="pladd" title="Добавить файл, папку или адрес"><span>Добавить</span></button>
+  <button id="plrename" title="Переименовать плейлист"></button>
+  <button id="plclear" class="danger" title="Очистить плейлист"></button>
+  <button id="pldelete" class="danger" title="Удалить плейлист"></button>
+  <input id="filter" type="search" placeholder="Поиск в плейлисте…" autocomplete="off">
+</div>
+
+<main id="list"><div id="rows"></div><div id="empty" hidden></div></main>
+<footer id="status">Подключение…</footer>
+<div id="toast" role="status"></div>
+
+<script>
+'use strict';
+
+const ICONS = {
+  play: 'M8 5v14l11-7z',
+  pause: 'M6 5h4v14H6zm8 0h4v14h-4z',
+  stop: 'M6 6h12v12H6z',
+  prev: 'M6 6h2v12H6zm3.5 6 8.5 6V6z',
+  next: 'M16 6h2v12h-2zM6 18l8.5-6L6 6z',
+  shuffle: 'M10.6 9.2 5.4 4 4 5.4l5.2 5.2zM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4zm.3 9.4-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2z',
+  repeat: 'M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z',
+  volume: 'M3 9v6h4l5 5V4L7 9zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z',
+  close: 'M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z',
+  trash: 'M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z',
+  add: 'M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z',
+  edit: 'M3 17.2V21h3.8L17.8 9.9l-3.7-3.7zM20.7 7a1 1 0 0 0 0-1.4l-2.3-2.3a1 1 0 0 0-1.4 0l-1.8 1.8 3.7 3.7z',
+  clear: 'M5 13h14v-2H5zm-2 4h14v-2H3zM7 7v2h14V7z',
+  locate: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.9 3A9 9 0 0 0 13 3.1V1h-2v2.1A9 9 0 0 0 3.1 11H1v2h2.1A9 9 0 0 0 11 20.9V23h2v-2.1A9 9 0 0 0 20.9 13H23v-2zM12 19a7 7 0 1 1 0-14 7 7 0 0 1 0 14z',
+  queue: 'M4 6h12v2H4zm0 4h12v2H4zm0 4h8v2H4zm10 0v6l5-3z',
+  note: 'M12 3v10.6A4 4 0 1 0 14 17V7h4V3z',
+};
+const icon = name => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+function fmtTime(ms) {
+  if (!(ms > 0)) return '0:00';
+  const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60;
+  const ss = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+
+/* ---- состояние ---- */
+let status = null;      // последний ответ /api/status
+let view = -1;          // номер просматриваемого плейлиста
+let list = null;        // загруженный плейлист (ответ /api/playlist)
+let shown = [];         // номера записей, прошедших фильтр
+let loading = false;
+let seeking = false, volDragging = false;
+let artKey = null;
+
+/* ---- сеть ---- */
+async function api(path, params) {
+  const opts = params === undefined ? {} : {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: new URLSearchParams(params).toString(),
+  };
+  const res = await fetch('/api/' + path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || res.statusText);
+    err.code = res.status;
+    throw err;
+  }
+  return data;
+}
+
+let toastTimer;
+function toast(text, isError) {
+  const el = $('toast');
+  el.textContent = text;
+  el.className = 'show' + (isError ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.className = '', 3000);
+}
+
+/* Выполняет команду и сразу обновляет экран. */
+async function cmd(action, params = {}) {
+  try {
+    const res = await api(action, params);
+    await poll();
+    return res;
+  } catch (e) {
+    if (e.code === 409) {
+      toast('Плейлист успел измениться — список обновлён, повторите действие', true);
+      await poll(true);
+    } else
+      toast('Ошибка: ' + e.message, true);
+    return null;
+  }
+}
+
+/* Команда над записью/плейлистом по номеру: сервер отклонит её, если состав
+ * плейлистов изменился после загрузки списка. */
+const plCmd = (action, params = {}) =>
+  cmd(action, {pl: view, sserial: list ? list.sserial : status.sserial, ...params});
+
+/* ---- опрос ---- */
+let pollBusy = false;
+async function poll(forceList) {
+  if (pollBusy) return;
+  pollBusy = true;
+  try {
+    status = await api('status');
+    const n = status.playlists.length;
+    if (view < 0) view = status.playing >= 0 ? status.playing : status.active;
+    if (view >= n) view = n - 1;
+    renderNow();
+    renderTabs();
+    if (forceList || !list || list.index !== view || list.serial !== status.serial ||
+        list.queued !== status.playlists[view].queued)
+      await loadList();
+    else
+      renderRows();
+    renderStatus();
+  } catch (e) {
+    $('status').textContent = 'Нет связи с Audacious (' + e.message + ')';
+  } finally {
+    pollBusy = false;
+  }
+}
+
+async function loadList() {
+  if (loading) return;
+  loading = true;
+  try {
+    const switched = !list || list.index !== view;
+    list = await api('playlist?pl=' + view);
+    applyFilter();
+    if (switched) scrollToCurrent(false);
+  } finally {
+    loading = false;
+  }
+}
+
+/* ---- сейчас играет ---- */
+function renderNow() {
+  const t = status.track, playing = status.state !== 'stopped';
+  $('title').textContent = t ? t.title : 'Ничего не играет';
+  $('artist').textContent = t ? [t.artist, t.album].filter(Boolean).join(' — ') : '';
+  $('info').textContent = t ? [t.codec, t.bitrate ? t.bitrate + ' кбит/с' : '',
+    t.samplerate ? (t.samplerate / 1000) + ' кГц' : ''].filter(Boolean).join(' · ') : '';
+  document.title = t ? (status.state === 'paused' ? '⏸ ' : '▶ ') + t.title + (t.artist ? ' — ' + t.artist : '') : 'Audacious';
+
+  const seek = $('seek');
+  seek.disabled = !t || !t.length;
+  if (!seeking) {
+    seek.max = t && t.length ? t.length : 1;
+    seek.value = t ? t.time : 0;
+    $('time').textContent = fmtTime(t ? t.time : 0);
+  }
+  $('length').textContent = fmtTime(t ? t.length : 0);
+
+  $('playpause').innerHTML = icon(status.state === 'playing' ? 'pause' : 'play');
+  $('stop').disabled = !playing;
+  $('removecur').disabled = !t;
+  $('shuffle').classList.toggle('on', status.shuffle);
+  $('repeat').classList.toggle('on', status.repeat);
+  if (!volDragging) $('volume').value = status.volume;
+
+  const key = t ? t.file : null;
+  if (key !== artKey) {
+    artKey = key;
+    loadArt(key, 0);
+  }
+}
+
+function loadArt(key, attempt) {
+  const box = $('art');
+  if (!key) { box.innerHTML = icon('note'); return; }
+  const img = new Image();
+  img.alt = '';
+  img.onload = () => { if (artKey === key) box.replaceChildren(img); };
+  img.onerror = () => {
+    if (artKey !== key) return;
+    box.innerHTML = icon('note');
+    // обложка может ещё читаться с диска — пробуем ещё пару раз
+    if (attempt < 3) setTimeout(() => { if (artKey === key) loadArt(key, attempt + 1); }, 1200);
+  };
+  img.src = '/api/art?f=' + encodeURIComponent(key) + (attempt ? '&r=' + attempt : '');
+}
+
+/* ---- вкладки плейлистов ---- */
+let tabsKey = '';
+function renderTabs() {
+  const key = JSON.stringify([status.playlists.map(p => [p.title, p.entries]), view, status.playing, status.state]);
+  if (key === tabsKey) return;
+  tabsKey = key;
+  const html = status.playlists.map((p, i) =>
+    `<button class="tab${i === view ? ' sel' : ''}" data-pl="${i}" title="${esc(p.title)}">` +
+    (i === status.playing && status.state !== 'stopped' ? icon('play') : '') +
+    `<span class="name">${esc(p.title)}</span><span class="count">${p.entries}</span></button>`).join('') +
+    `<button class="tab" id="plnew" title="Новый плейлист">${icon('add')}</button>`;
+  $('tabs').innerHTML = html;
+  const sel = $('tabs').querySelector('.sel');
+  if (sel) sel.scrollIntoView({block: 'nearest', inline: 'nearest'});
+}
+
+$('tabs').addEventListener('click', async e => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  if (tab.id === 'plnew') {
+    const title = prompt('Название нового плейлиста:', '');
+    if (title === null) return;
+    const res = await cmd('playlist_new', {title: title.trim()});
+    if (res) { view = res.index; await poll(true); }
+    return;
+  }
+  const pl = +tab.dataset.pl;
+  if (pl === view) return;
+  view = pl;
+  $('filter').value = '';
+  tabsKey = '';
+  renderTabs();
+  // переключаем и в самом Audacious, чтобы окно плеера показывало тот же лист
+  api('activate', {pl}).catch(() => {});
+  await poll(true);
+});
+
+/* ---- список треков (виртуальная прокрутка) ---- */
+const ROW = 48;
+const listEl = $('list'), rowsEl = $('rows');
+
+function applyFilter() {
+  const words = $('filter').value.toLowerCase().split(/\s+/).filter(Boolean);
+  const entries = list ? list.entries : [];
+  shown = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (words.length) {
+      const e = entries[i], hay = (e[0] + '\n' + e[1] + '\n' + e[2]).toLowerCase();
+      if (!words.every(w => hay.includes(w))) continue;
+    }
+    shown.push(i);
+  }
+  renderRows(true);
+}
+
+let rowsKey = '';
+function renderRows(force) {
+  if (!list || !status) return;
+  const pos = status.playlists[view] ? status.playlists[view].position : -1;
+  const isPlaying = view === status.playing && status.state !== 'stopped';
+  const first = Math.max(0, Math.floor(listEl.scrollTop / ROW) - 8);
+  const last = Math.min(shown.length, Math.ceil((listEl.scrollTop + listEl.clientHeight) / ROW) + 8);
+  const key = [first, last, pos, isPlaying, shown.length].join();
+  if (!force && key === rowsKey) return;
+  rowsKey = key;
+
+  const empty = $('empty');
+  empty.hidden = shown.length > 0;
+  if (!shown.length)
+    empty.textContent = list.entries.length ? 'Ничего не найдено' : 'Плейлист пуст';
+
+  rowsEl.style.height = shown.length * ROW + 'px';
+  let html = `<div style="height:${first * ROW}px"></div>`;
+  for (let k = first; k < last; k++) {
+    const i = shown[k], e = list.entries[i];
+    const sub = [e[1], e[2]].filter(Boolean).join(' — ');
+    html += `<div class="row${i === pos ? ' cur' : ''}" data-i="${i}">` +
+      `<div class="num">${i === pos && isPlaying ? '▶' : i + 1}</div>` +
+      `<div class="text"><div class="t">${esc(e[0])}</div>${sub ? `<div class="a">${esc(sub)}</div>` : ''}</div>` +
+      (e[4] ? `<span class="q" title="Место в очереди">${e[4]}</span>` : '') +
+      `<span class="len">${e[3] ? fmtTime(e[3]) : ''}</span>` +
+      `<button data-act="queue" title="В очередь / из очереди">${icon('queue')}</button>` +
+      `<button data-act="remove" class="danger" title="Удалить из плейлиста">${icon('close')}</button>` +
+      `</div>`;
+  }
+  rowsEl.innerHTML = html;
+}
+
+listEl.addEventListener('scroll', () => renderRows(), {passive: true});
+window.addEventListener('resize', () => renderRows());
+
+rowsEl.addEventListener('click', async e => {
+  const row = e.target.closest('.row');
+  if (!row) return;
+  const entry = +row.dataset.i;
+  const btn = e.target.closest('button');
+  if (!btn)
+    return plCmd('jump', {entry});
+  if (btn.dataset.act === 'queue')
+    return plCmd('queue', {entry});
+  if (btn.dataset.act === 'remove') {
+    const title = list.entries[entry][0];
+    if (await plCmd('remove', {entry})) toast('Удалено из плейлиста: ' + title);
+  }
+});
+
+function scrollToCurrent(smooth) {
+  if (!status || !status.playlists[view]) return;
+  const k = shown.indexOf(status.playlists[view].position);
+  if (k < 0) return;
+  listEl.scrollTo({top: Math.max(0, k * ROW - listEl.clientHeight / 2 + ROW), behavior: smooth ? 'smooth' : 'auto'});
+  renderRows();
+}
+
+function renderStatus() {
+  if (!list) return;
+  const n = list.entries.length;
+  let text = `${n} ${plural(n, 'трек', 'трека', 'треков')}`;
+  if (list.total_ms > 0) text += ' · ' + fmtTime(list.total_ms);
+  if (shown.length !== n) text += ` · показано ${shown.length}`;
+  $('status').textContent = text;
+}
+
+function plural(n, one, few, many) {
+  const d = n % 10, h = n % 100;
+  if (d === 1 && h !== 11) return one;
+  if (d >= 2 && d <= 4 && (h < 12 || h > 14)) return few;
+  return many;
+}
+
+/* ---- кнопки ---- */
+function setup(id, iconName, handler) {
+  const el = $(id);
+  if (iconName) el.insertAdjacentHTML('afterbegin', icon(iconName));
+  el.addEventListener('click', handler);
+}
+
+setup('prev', 'prev', () => cmd('prev'));
+setup('next', 'next', () => cmd('next'));
+setup('stop', 'stop', () => cmd('stop'));
+setup('playpause', null, () => cmd('playpause'));
+setup('shuffle', 'shuffle', () => cmd('shuffle'));
+setup('repeat', 'repeat', () => cmd('repeat'));
+setup('removecur', 'trash', async () => {
+  const t = status && status.track;
+  if (!t) return;
+  // номер записи защищает от удаления соседнего трека при смене песни
+  if (await cmd('remove_current', {entry: t.entry}))
+    toast('Удалено из плейлиста: ' + t.title);
+});
+$('volrow').insertAdjacentHTML('afterbegin', icon('volume'));
+
+setup('plplay', 'play', () => plCmd('playlist_play'));
+setup('locate', 'locate', async () => {
+  if (status.playing >= 0 && status.playing !== view) {
+    view = status.playing;
+    $('filter').value = '';
+    await poll(true);
+  } else if ($('filter').value) {
+    $('filter').value = '';
+    applyFilter();
+  }
+  scrollToCurrent(true);
+});
+setup('pladd', 'add', async () => {
+  const uri = prompt('Путь к файлу или папке на компьютере с Audacious,\nлибо адрес (http://… и т.п.):', '');
+  if (uri && uri.trim() && await plCmd('add', {uri: uri.trim()})) toast('Добавляется…');
+});
+setup('plrename', 'edit', () => {
+  const title = prompt('Новое название плейлиста:', status.playlists[view].title);
+  if (title && title.trim()) plCmd('playlist_rename', {title: title.trim()});
+});
+setup('plclear', 'clear', () => {
+  const p = status.playlists[view];
+  if (confirm(`Убрать все треки (${p.entries}) из плейлиста «${p.title}»?`)) plCmd('playlist_clear');
+});
+setup('pldelete', 'trash', () => {
+  const p = status.playlists[view];
+  if (confirm(`Удалить плейлист «${p.title}» (${p.entries} ${plural(p.entries, 'трек', 'трека', 'треков')})?`))
+    plCmd('playlist_delete');
+});
+
+let filterTimer;
+$('filter').addEventListener('input', () => {
+  clearTimeout(filterTimer);
+  filterTimer = setTimeout(() => { listEl.scrollTop = 0; applyFilter(); renderStatus(); }, 120);
+});
+
+/* ---- перемотка и громкость ---- */
+const seekEl = $('seek');
+seekEl.addEventListener('input', () => { seeking = true; $('time').textContent = fmtTime(+seekEl.value); });
+seekEl.addEventListener('change', async () => {
+  await cmd('seek', {time: seekEl.value});
+  seeking = false;
+});
+
+const volEl = $('volume');
+let volTimer = null, volPending = null;
+function sendVolume() {
+  if (volPending === null) { volTimer = null; return; }
+  const value = volPending;
+  volPending = null;
+  api('volume', {value}).catch(() => {});
+  volTimer = setTimeout(sendVolume, 100);
+}
+volEl.addEventListener('input', () => {
+  volDragging = true;
+  volPending = volEl.value;
+  if (!volTimer) sendVolume();
+});
+volEl.addEventListener('change', () => setTimeout(() => volDragging = false, 400));
+
+document.addEventListener('keydown', e => {
+  if (e.target.closest('input, button') || e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.key === ' ') { e.preventDefault(); cmd('playpause'); }
+});
+
+/* ---- запуск ---- */
+setInterval(() => { if (!document.hidden) poll(); }, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+poll();
+</script>
+</body>
+</html>
