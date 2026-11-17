@@ -21,6 +21,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   display: flex; flex-direction: column; height: 100dvh;
@@ -68,7 +69,7 @@ svg { width: 22px; height: 22px; fill: currentColor; flex: none; }
 #volume { width: 110px; }
 input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; margin: 0; }
 #seek { flex: 1; }
-#removecur span { font-size: 13px; }
+#removecur span, #listen span { font-size: 13px; }
 
 /* ---- плейлисты ---- */
 #tabs {
@@ -125,6 +126,9 @@ input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; mar
   transition: opacity .2s; box-shadow: 0 6px 24px rgba(0,0,0,.35);
 }
 #toast.show { opacity: 1; }
+#toast.show.act { pointer-events: auto; display: flex; align-items: center; gap: 12px; }
+#toast button { color: var(--accent); font-weight: 600; padding: 4px 10px; min-height: 30px; }
+body.drag #list { outline: 2px dashed var(--accent); outline-offset: -6px; }
 #toast.err { border-color: var(--danger); }
 
 @media (max-width: 640px) {
@@ -132,7 +136,7 @@ input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; mar
   #art { width: 72px; height: 72px; }
   #title { font-size: 16px; }
   #volume { width: 80px; }
-  #toolbar button span, #removecur span { display: none; }
+  #toolbar button span, #removecur span, #listen span { display: none; }
   .row .num { width: 44px; padding-right: 8px; }
 }
 </style>
@@ -157,8 +161,10 @@ input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; mar
     <button id="stop" title="Стоп"></button>
     <button id="next" title="Следующий"></button>
     <button id="shuffle" title="Случайный порядок"></button>
-    <button id="repeat" title="Повтор"></button>
+    <button id="repeat" title="Повтор плейлиста"></button>
+    <button id="repeatone" title="Повторять текущий трек"></button>
     <button id="removecur" class="danger" title="Удалить играющий трек из плейлиста"><span>Убрать текущий</span></button>
+    <button id="listen" hidden title="Слушать звук плеера в этом браузере"><span>Слушать здесь</span></button>
     <span class="spacer"></span>
     <label id="volrow" title="Громкость">
       <input id="volume" type="range" min="0" max="100" value="0" aria-label="Громкость">
@@ -171,7 +177,10 @@ input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; mar
 <div id="toolbar">
   <button id="plplay" title="Играть этот плейлист"><span>Играть</span></button>
   <button id="locate" title="Показать текущий трек"><span>К текущему</span></button>
-  <button id="pladd" title="Добавить файл, папку или адрес"><span>Добавить</span></button>
+  <button id="pladd" title="Добавить файл, папку или адрес с компьютера, где работает Audacious"><span>Добавить</span></button>
+  <button id="upload" hidden title="Загрузить файлы с этого устройства и добавить в плейлист"><span>Загрузить</span></button>
+  <input id="upfile" type="file" multiple hidden accept=".mp3,.wav,.flac,.xm,.s3m,.mod,.it,.ogg,.opus,.m4a">
+  <button id="undo" hidden><span>Вернуть</span></button>
   <button id="plrename" title="Переименовать плейлист"></button>
   <button id="plclear" class="danger" title="Очистить плейлист"></button>
   <button id="pldelete" class="danger" title="Удалить плейлист"></button>
@@ -193,6 +202,7 @@ const ICONS = {
   next: 'M16 6h2v12h-2zM6 18l8.5-6L6 6z',
   shuffle: 'M10.6 9.2 5.4 4 4 5.4l5.2 5.2zM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4zm.3 9.4-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2z',
   repeat: 'M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2z',
+  repeatone: 'M7 7h10v3l4-4-4-4v3H5v6h2zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2zm-4-2V9h-1l-2 1v1h1.5v4z',
   volume: 'M3 9v6h4l5 5V4L7 9zm13.5 3A4.5 4.5 0 0 0 14 8v8a4.5 4.5 0 0 0 2.5-4z',
   close: 'M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12z',
   trash: 'M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6zM19 4h-3.5l-1-1h-5l-1 1H5v2h14z',
@@ -202,6 +212,9 @@ const ICONS = {
   locate: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.9 3A9 9 0 0 0 13 3.1V1h-2v2.1A9 9 0 0 0 3.1 11H1v2h2.1A9 9 0 0 0 11 20.9V23h2v-2.1A9 9 0 0 0 20.9 13H23v-2zM12 19a7 7 0 1 1 0-14 7 7 0 0 1 0 14z',
   queue: 'M4 6h12v2H4zm0 4h12v2H4zm0 4h8v2H4zm10 0v6l5-3z',
   note: 'M12 3v10.6A4 4 0 1 0 14 17V7h4V3z',
+  undo: 'M12.5 8c-2.6 0-5 1-6.9 2.6L2 7v9h9l-3.6-3.6A8 8 0 0 1 20.1 16l2.4-.8A10.5 10.5 0 0 0 12.5 8z',
+  upload: 'M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z',
+  listen: 'M12 3a9 9 0 0 0-9 9v7a2 2 0 0 0 2 2h3v-8H5v-1a7 7 0 0 1 14 0v1h-3v8h3a2 2 0 0 0 2-2v-7a9 9 0 0 0-9-9z',
 };
 const icon = name => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
 const $ = id => document.getElementById(id);
@@ -215,6 +228,8 @@ function fmtTime(ms) {
 }
 
 /* ---- состояние ---- */
+// Все адреса на странице относительные, чтобы она работала и за обратным
+// прокси под любым префиксом (например, https://example.org/player/).
 let status = null;      // последний ответ /api/status
 let view = -1;          // номер просматриваемого плейлиста
 let list = null;        // загруженный плейлист (ответ /api/playlist)
@@ -230,8 +245,19 @@ async function api(path, params) {
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
     body: new URLSearchParams(params).toString(),
   };
-  const res = await fetch('/api/' + path, opts);
-  const data = await res.json().catch(() => ({}));
+  // Без ограничения по времени запрос, отправленный в момент обрыва Wi-Fi,
+  // может висеть минутами — и всё это время страница не обновлялась бы.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 6000);
+  let res, data;
+  try {
+    res = await fetch('api/' + path, {...opts, signal: ctl.signal});
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    throw new Error(e.name === 'AbortError' ? 'нет ответа' : e.message);
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) {
     const err = new Error(data.error || res.statusText);
     err.code = res.status;
@@ -241,13 +267,36 @@ async function api(path, params) {
 }
 
 let toastTimer;
-function toast(text, isError) {
+function toast(text, isError, action) {
   const el = $('toast');
   el.textContent = text;
-  el.className = 'show' + (isError ? ' err' : '');
+  if (action) {
+    const btn = document.createElement('button');
+    btn.textContent = action.label;
+    btn.onclick = () => { el.className = ''; action.run(); };
+    el.append(btn);
+  }
+  el.className = 'show' + (isError ? ' err' : '') + (action ? ' act' : '');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.className = '', 3000);
+  toastTimer = setTimeout(() => el.className = '', action ? 8000 : 3000);
 }
+
+/* ---- отмена удаления ---- */
+async function undo() {
+  const res = await cmd('undo');
+  if (!res) return;
+  if (res.pl !== view) {
+    view = res.pl;
+    $('filter').value = '';
+  }
+  await poll(true);
+  // показываем, куда вернулся трек
+  const k = shown.indexOf(res.entry);
+  if (k >= 0) listEl.scrollTo({top: Math.max(0, k * ROW - listEl.clientHeight / 2 + ROW)});
+  renderRows();
+  toast(res.count > 1 ? `Возвращено треков: ${res.count}` : 'Трек возвращён в плейлист');
+}
+const removedToast = title => toast('Удалено из плейлиста: ' + title, false, {label: 'Вернуть', run: undo});
 
 /* Выполняет команду и сразу обновляет экран. */
 async function cmd(action, params = {}) {
@@ -331,7 +380,13 @@ function renderNow() {
   $('removecur').disabled = !t;
   $('shuffle').classList.toggle('on', status.shuffle);
   $('repeat').classList.toggle('on', status.repeat);
+  $('repeatone').classList.toggle('on', status.repeat_one);
   if (!volDragging) $('volume').value = status.volume;
+  $('listen').hidden = !status.stream && !wantListen;
+  $('upload').hidden = !status.upload;
+  $('undo').hidden = !status.undo;
+  $('undo').title = status.undo ? 'Вернуть удалённое: ' + status.undo_title : '';
+  if (wantListen && !status.stream) setListening(false);
 
   const key = t ? t.file : null;
   if (key !== artKey) {
@@ -352,7 +407,7 @@ function loadArt(key, attempt) {
     // обложка может ещё читаться с диска — пробуем ещё пару раз
     if (attempt < 3) setTimeout(() => { if (artKey === key) loadArt(key, attempt + 1); }, 1200);
   };
-  img.src = '/api/art?f=' + encodeURIComponent(key) + (attempt ? '&r=' + attempt : '');
+  img.src = 'api/art?f=' + encodeURIComponent(key) + (attempt ? '&r=' + attempt : '');
 }
 
 /* ---- вкладки плейлистов ---- */
@@ -457,7 +512,7 @@ rowsEl.addEventListener('click', async e => {
     return plCmd('queue', {entry});
   if (btn.dataset.act === 'remove') {
     const title = list.entries[entry][0];
-    if (await plCmd('remove', {entry})) toast('Удалено из плейлиста: ' + title);
+    if (await plCmd('remove', {entry})) removedToast(title);
   }
 });
 
@@ -498,14 +553,136 @@ setup('stop', 'stop', () => cmd('stop'));
 setup('playpause', null, () => cmd('playpause'));
 setup('shuffle', 'shuffle', () => cmd('shuffle'));
 setup('repeat', 'repeat', () => cmd('repeat'));
+setup('repeatone', 'repeatone', () => cmd('repeat_one'));
 setup('removecur', 'trash', async () => {
   const t = status && status.track;
   if (!t) return;
   // номер записи защищает от удаления соседнего трека при смене песни
   if (await cmd('remove_current', {entry: t.entry}))
-    toast('Удалено из плейлиста: ' + t.title);
+    removedToast(t.title);
 });
 $('volrow').insertAdjacentHTML('afterbegin', icon('volume'));
+
+/* ---- трансляция звука в этот браузер ---- */
+
+/* live-player:begin */
+/* Проигрыватель живого MP3-потока с малой задержкой.
+ *
+ * Обычный <audio src> перед стартом накапливает 2–3 секунды и так с этим
+ * отставанием и играет. Здесь поток читается через fetch и подаётся в
+ * MediaSource, а позиция воспроизведения удерживается у самого конца
+ * полученных данных: небольшое отставание выбирается чуть ускоренным
+ * воспроизведением, большое — прыжком. Где MediaSource с MP3 недоступен,
+ * остаётся обычный <audio>. */
+function createLivePlayer(url, onLost, a = new Audio()) {
+  const TARGET = 0.25;                    // желаемый запас в буфере, с
+  const STALL_MS = 4000;                  // столько без данных — связь потеряна
+  const ctl = new AbortController();
+  let stopped = false, timer = null, lastData = performance.now();
+
+  const edge = () => a.buffered.length ? a.buffered.end(a.buffered.length - 1) : 0;
+  const player = {
+    audio: a,
+    lag: () => a.buffered.length ? edge() - a.currentTime : 0,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      ctl.abort();
+      a.onerror = a.onended = null;
+      a.pause();
+      a.removeAttribute('src');           // разрывает соединение с потоком
+      a.load();
+    },
+  };
+  const fail = () => { if (!stopped) { player.stop(); onLost(); } };
+
+  const MS = window.ManagedMediaSource || window.MediaSource;
+  if (!MS || !MS.isTypeSupported('audio/mpeg') || !window.ReadableStream) {
+    a.src = url;
+    a.onerror = a.onended = fail;
+    a.play().catch(fail);
+    return player;
+  }
+
+  const ms = new MS();
+  a.disableRemotePlayback = true;         // требование ManagedMediaSource
+  a.src = URL.createObjectURL(ms);
+  a.onerror = fail;
+
+  ms.addEventListener('sourceopen', async () => {
+    try {
+      const sb = ms.addSourceBuffer('audio/mpeg');
+      const idle = () => sb.updating
+        ? new Promise(done => sb.addEventListener('updateend', done, {once: true}))
+        : Promise.resolve();
+      const res = await fetch(url, {signal: ctl.signal, cache: 'no-store'});
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const reader = res.body.getReader();
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        lastData = performance.now();
+        await idle();
+        sb.appendBuffer(value);
+        await idle();
+        // сыгранное не храним
+        if (sb.buffered.length && a.currentTime - sb.buffered.start(0) > 20) {
+          sb.remove(0, a.currentTime - 5);
+          await idle();
+        }
+      }
+      fail();
+    } catch (e) {
+      fail();
+    }
+  }, {once: true});
+
+  timer = setInterval(() => {
+    if (performance.now() - lastData > STALL_MS) return fail();
+    if (!a.buffered.length) return;
+    const lag = edge() - a.currentTime;
+    if (lag > 1.5)
+      a.currentTime = edge() - TARGET;    // сильно отстали — прыжок к краю
+    else
+      a.playbackRate = lag > TARGET + 0.15 ? 1.08 : lag < TARGET - 0.15 ? 0.95 : 1;
+  }, 100);
+
+  a.play().catch(e => { if (e.name !== 'AbortError') fail(); });
+  return player;
+}
+/* live-player:end */
+
+/* Пока трансляция включена, обрыв связи её не выключает: проигрыватель
+ * переподключается сам, пока не получится. Элемент <audio> один на всё
+ * время — запущенному по нажатию элементу браузер разрешает играть снова. */
+const liveAudio = new Audio();
+let wantListen = false, audio = null, retryTimer = null, lostShown = false;
+
+function connectStream() {
+  clearTimeout(retryTimer);
+  if (audio) {
+    audio.stop();
+    audio = null;
+  }
+  if (!wantListen) return;
+  const p = audio = createLivePlayer('stream.mp3?t=' + Date.now(), () => {
+    if (audio !== p) return;
+    audio = null;
+    if (!lostShown) toast('Трансляция прервалась — переподключаюсь…', true);
+    lostShown = true;
+    retryTimer = setTimeout(connectStream, 2000);
+  }, liveAudio);
+  liveAudio.addEventListener('playing', () => { if (audio === p) lostShown = false; }, {once: true});
+}
+
+function setListening(on) {
+  wantListen = on;
+  lostShown = false;
+  connectStream();
+  $('listen').classList.toggle('on', wantListen);
+}
+setup('listen', 'listen', () => setListening(!wantListen));
 
 setup('plplay', 'play', () => plCmd('playlist_play'));
 setup('locate', 'locate', async () => {
@@ -527,9 +704,94 @@ setup('plrename', 'edit', () => {
   const title = prompt('Новое название плейлиста:', status.playlists[view].title);
   if (title && title.trim()) plCmd('playlist_rename', {title: title.trim()});
 });
+setup('undo', 'undo', undo);
+
+/* ---- загрузка файлов с этого устройства ---- */
+const UPLOAD_EXTS = ['mp3', 'wav', 'flac', 'xm', 's3m', 'mod', 'it', 'ogg', 'opus', 'm4a'];
+let uploading = false;
+
+function uploadOne(file, pl, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', 'api/upload?pl=' + pl + '&name=' + encodeURIComponent(file.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (e) {}
+      if (xhr.status === 200) resolve(data);
+      else reject(new Error(xhr.status === 413 ? 'файл слишком большой' : data.error || 'HTTP ' + xhr.status));
+    };
+    xhr.onerror = () => reject(new Error('нет связи'));
+    xhr.send(file);
+  });
+}
+
+async function uploadFiles(files) {
+  if (uploading) return toast('Дождитесь окончания текущей загрузки', true);
+  const good = files.filter(f => UPLOAD_EXTS.includes(f.name.split('.').pop().toLowerCase()));
+  const skipped = files.length - good.length;
+  if (!good.length)
+    return toast('Можно загружать только: ' + UPLOAD_EXTS.join(', '), true);
+
+  uploading = true;
+  const pl = view, el = $('toast');
+  let done = 0, failed = [];
+  for (const file of good) {
+    const label = `Загрузка ${done + failed.length + 1} из ${good.length}: ${file.name}`;
+    const show = part => {            // сообщение держится, пока идёт загрузка
+      clearTimeout(toastTimer);
+      el.textContent = `${label} — ${Math.round(part * 100)}%`;
+      el.className = 'show';
+    };
+    show(0);
+    try {
+      await uploadOne(file, pl, show);
+      done++;
+    } catch (e) {
+      failed.push(`${file.name} (${e.message})`);
+    }
+  }
+  uploading = false;
+
+  let text = `Загружено и добавлено в плейлист: ${done}`;
+  if (skipped) text += `, пропущено неподходящих: ${skipped}`;
+  if (failed.length) text += `. Не удалось: ${failed.join('; ')}`;
+  toast(text, failed.length > 0);
+  poll(true);
+}
+
+setup('upload', 'upload', () => $('upfile').click());
+$('upfile').addEventListener('change', e => {
+  const files = [...e.target.files];
+  e.target.value = '';                // чтобы тот же файл можно было выбрать снова
+  if (files.length) uploadFiles(files);
+});
+
+// файлы можно просто перетащить на страницу
+let dragDepth = 0;
+const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+document.addEventListener('dragenter', e => {
+  if (!hasFiles(e) || !status || !status.upload) return;
+  dragDepth++;
+  document.body.classList.add('drag');
+});
+document.addEventListener('dragleave', e => {
+  if (dragDepth && !--dragDepth) document.body.classList.remove('drag');
+});
+document.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+document.addEventListener('drop', e => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove('drag');
+  if (status && status.upload) uploadFiles([...e.dataTransfer.files]);
+});
+
 setup('plclear', 'clear', () => {
   const p = status.playlists[view];
-  if (confirm(`Убрать все треки (${p.entries}) из плейлиста «${p.title}»?`)) plCmd('playlist_clear');
+  if (confirm(`Убрать все треки (${p.entries}) из плейлиста «${p.title}»?`)) 
+    plCmd('playlist_clear').then(res => res && toast('Плейлист очищен', false, {label: 'Вернуть', run: undo}));
 });
 setup('pldelete', 'trash', () => {
   const p = status.playlists[view];
@@ -568,7 +830,12 @@ volEl.addEventListener('input', () => {
 volEl.addEventListener('change', () => setTimeout(() => volDragging = false, 400));
 
 document.addEventListener('keydown', e => {
-  if (e.target.closest('input, button') || e.ctrlKey || e.altKey || e.metaKey) return;
+  if (e.target.closest('input')) return;
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'z' && status && status.undo) {
+    e.preventDefault();
+    return undo();
+  }
+  if (e.target.closest('button') || e.ctrlKey || e.altKey || e.metaKey) return;
   if (e.key === ' ') { e.preventDefault(); cmd('playpause'); }
 });
 

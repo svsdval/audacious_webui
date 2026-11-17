@@ -14,6 +14,7 @@ CXXFLAGS += -std=c++17 -fPIC -fvisibility=hidden -Wall -Wextra -Wno-unused-param
 
 BUILD := build
 PLUGIN := $(BUILD)/webremote.so
+TAP    := $(BUILD)/webremote-stream.so
 
 ifeq ($(shell pkg-config --exists audacious && echo yes),yes)
   AUD_CFLAGS := $(shell pkg-config --cflags audacious)
@@ -30,10 +31,15 @@ else
   PLUGIN_DIR  ?= $(dir $(AUD_LIB))audacious
 endif
 
-all: $(PLUGIN)
+all: $(PLUGIN) $(TAP)
 
-$(PLUGIN): src/webremote.cc $(BUILD)/index_html.inc $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(AUD_CFLAGS) -I$(BUILD) -shared -o $@ $< $(AUD_LIBS)
+$(PLUGIN): src/webremote.cc src/webremote-pcm.h $(BUILD)/index_html.inc $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(AUD_CFLAGS) -I$(BUILD) -shared -o $@ $< $(AUD_LIBS) -ldl
+
+# эффект-плагин, отводящий звук для трансляции в MP3
+$(TAP): src/webremote-stream.cc src/webremote-pcm.h $(HEADERS)
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(AUD_CFLAGS) -shared -o $@ $< $(AUD_LIBS)
 
 # веб-страница встраивается в плагин как строковый литерал
 $(BUILD)/index_html.inc: web/index.html
@@ -50,15 +56,17 @@ $(HEADERS):
 	sed 's/@BIGENDIAN@/(__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)/' \
 	    $(AUD_SRC)/src/libaudcore/audio.h.in > $@
 
-install: $(PLUGIN)
+install: all
 	install -D -m 644 $(PLUGIN) $(DESTDIR)$(PLUGIN_DIR)/General/webremote.so
+	install -D -m 644 $(TAP) $(DESTDIR)$(PLUGIN_DIR)/Effect/webremote-stream.so
 
 uninstall:
 	rm -f $(DESTDIR)$(PLUGIN_DIR)/General/webremote.so
+	rm -f $(DESTDIR)$(PLUGIN_DIR)/Effect/webremote-stream.so
 
 # Отдельный экземпляр Audacious со своими настройками и своим каталогом
 # плагинов: позволяет попробовать плагин без установки в систему.
-sandbox: $(PLUGIN)
+sandbox: all
 	./tools/sandbox.sh $(PLUGIN) $(PLUGIN_DIR)
 
 clean:

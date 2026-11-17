@@ -32,6 +32,7 @@ for dir in "$sys_plugins"/*/; do
     ln -s "$dir"*.so "$sandbox/$rel/$type/"
 done
 ln -sf "$plugin" "$sandbox/$rel/General/webremote.so"
+ln -sf "$(dirname "$plugin")/webremote-stream.so" "$sandbox/$rel/Effect/webremote-stream.so"
 
 # Экземпляр №9: свой каталог настроек и своё имя в D-Bus, поэтому он не
 # пересекается с уже запущенным Audacious.

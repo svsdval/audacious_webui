@@ -7,6 +7,7 @@
  */
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -14,10 +15,13 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -27,6 +31,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <libaudcore/audstrings.h>
 #include <libaudcore/drct.h>
@@ -34,10 +39,13 @@
 #include <libaudcore/mainloop.h>
 #include <libaudcore/playlist.h>
 #include <libaudcore/plugin.h>
+#include <libaudcore/plugins.h>
 #include <libaudcore/preferences.h>
 #include <libaudcore/probe.h>
 #include <libaudcore/runtime.h>
 #include <libaudcore/tuple.h>
+
+#include "webremote-pcm.h"
 
 #define CFG "web_remote"
 #define EXPORT __attribute__((visibility("default")))
@@ -51,6 +59,7 @@ static const char index_html[] =
 /* ------------------------------------------------------------------------ */
 
 static void config_changed();
+static void stream_config_changed();
 
 class WebRemote : public GeneralPlugin
 {
@@ -79,7 +88,9 @@ const char WebRemote::about[] =
 
 const char * const WebRemote::defaults[] = {"port",   "8421", "remote",
                                             "FALSE",  "password", "",
-                                            nullptr};
+                                            "stream", "FALSE", "stream_bitrate",
+                                            "192",    "upload", "TRUE",
+                                            "upload_dir", "", nullptr};
 
 const PreferencesWidget WebRemote::widgets[] = {
     WidgetSpin("Порт:", WidgetInt(CFG, "port", config_changed),
@@ -89,7 +100,21 @@ const PreferencesWidget WebRemote::widgets[] = {
     WidgetEntry("Пароль (пусто — без пароля):",
                 WidgetString(CFG, "password", config_changed), {true}),
     WidgetLabel("Логин при входе может быть любым. Без пароля управлять\n"
-                "плеером сможет любой, кому доступен этот порт.")};
+                "плеером сможет любой, кому доступен этот порт."),
+    WidgetCheck("Трансляция звука в браузер (MP3)",
+                WidgetBool(CFG, "stream", stream_config_changed)),
+    WidgetSpin("Битрейт:", WidgetInt(CFG, "stream_bitrate"),
+               {64, 320, 32, "кбит/с"}, WIDGET_CHILD),
+    WidgetLabel("На странице появится кнопка «Слушать здесь». Поток также\n"
+                "доступен плеерам по адресу /stream.mp3. Новый битрейт\n"
+                "применяется со следующего трека."),
+    WidgetCheck("Разрешить загрузку файлов со страницы",
+                WidgetBool(CFG, "upload")),
+    WidgetFileEntry("Папка для загруженных файлов:",
+                    WidgetString(CFG, "upload_dir"), {FileSelectMode::Folder},
+                    WIDGET_CHILD),
+    WidgetLabel("Если папка не выбрана, файлы сохраняются в\n"
+                "~/Music/Audacious Web.")};
 
 const PluginPreferences WebRemote::prefs = {{widgets}};
 
@@ -104,6 +129,8 @@ struct Request
     std::string method, path;
     Params params;  /* query string + тело формы */
     Params headers; /* имена в нижнем регистре */
+    size_t body_len = 0; /* только для загрузки файла: тело ещё не прочитано */
+    bool http10 = false;
 };
 
 struct Response
@@ -295,6 +322,10 @@ static const char * status_text(int code)
         return "Conflict";
     case 413:
         return "Payload Too Large";
+    case 415:
+        return "Unsupported Media Type";
+    case 500:
+        return "Internal Server Error";
     default:
         return "Service Unavailable";
     }
@@ -369,6 +400,8 @@ static Response run_in_main(std::function<Response()> func)
  * дочитывании тегов), structure_serial — только при изменении состава.
  * Изменения очереди счётчики не затрагивают (они приходят вместе с
  * изменениями выделения), поэтому длина очереди отдаётся отдельно. */
+static std::atomic<bool> stream_running{false};
+static bool stream_available();
 static std::atomic<int> serial{1};
 static std::atomic<int> structure_serial{1};
 
@@ -422,6 +455,67 @@ static std::string tuple_title(const Tuple & tuple, const char * uri)
 
 static const char * safe(const String & s) { return s ? (const char *)s : ""; }
 
+/* --- отмена удаления --- */
+
+/* Удалённые записи запоминаются вместе с тегами, чтобы их можно было
+ * вернуть на прежнее место. Используется только в главном потоке. */
+struct UndoItem
+{
+    Playlist list;
+    int at;
+    Index<PlaylistAddItem> items;
+    std::string title; /* что показать на кнопке «Вернуть» */
+};
+
+static const size_t UNDO_MAX = 30;
+static std::deque<UndoItem> undo_stack;
+
+/* вызывается перед удалением <count> записей, начиная с <at> */
+static void undo_remember(Playlist list, int at, int count)
+{
+    if (count <= 0)
+        return;
+
+    UndoItem item;
+    item.list = list;
+    item.at = at;
+    for (int i = at; i < at + count; i++)
+        item.items.append(list.entry_filename(i),
+                          list.entry_tuple(i, Playlist::NoWait), nullptr);
+
+    if (count == 1)
+        item.title = tuple_title(item.items[0].tuple, item.items[0].filename);
+    else
+        item.title = std::string("весь плейлист «") + safe(list.get_title()) +
+                     "» (" + std::to_string(count) + ")";
+
+    undo_stack.push_back(std::move(item));
+    if (undo_stack.size() > UNDO_MAX)
+        undo_stack.pop_front();
+}
+
+static Response api_undo()
+{
+    /* плейлист могли удалить — возвращать уже некуда */
+    while (!undo_stack.empty() && !undo_stack.back().list.exists())
+        undo_stack.pop_back();
+    if (undo_stack.empty())
+        return error_response(409, "nothing to undo");
+
+    UndoItem item = std::move(undo_stack.back());
+    undo_stack.pop_back();
+
+    int count = item.items.len();
+    int at = aud::min(item.at, item.list.n_entries());
+    item.list.insert_items(at, std::move(item.items), false);
+
+    Response r;
+    r.body = "{\"ok\":true,\"pl\":" + std::to_string(item.list.index()) +
+             ",\"entry\":" + std::to_string(at) +
+             ",\"count\":" + std::to_string(count) + "}";
+    return r;
+}
+
 static Response api_status()
 {
     std::string out = "{";
@@ -433,11 +527,21 @@ static Response api_status()
     json_field(out, "state", !playing ? "stopped" : paused ? "paused" : "playing");
     json_field(out, "volume", aud_drct_get_volume_main());
     json_field(out, "shuffle", aud_get_bool(nullptr, "shuffle"));
-    json_field(out, "repeat", aud_get_bool(nullptr, "repeat"));
+    /* «Повтор трека» в Audacious — это сочетание двух настроек: «повтор» и
+     * «не переходить к следующему». Странице отдаются два раздельных режима. */
+    bool repeat = aud_get_bool(nullptr, "repeat");
+    bool no_advance = aud_get_bool(nullptr, "no_playlist_advance");
+    json_field(out, "repeat", repeat && !no_advance);
+    json_field(out, "repeat_one", repeat && no_advance);
     json_field(out, "serial", serial.load());
     json_field(out, "sserial", structure_serial.load());
     json_field(out, "active", Playlist::active_playlist().index());
     json_field(out, "playing", Playlist::playing_playlist().index());
+    json_field(out, "stream", stream_available());
+    json_field(out, "upload", aud_get_bool(CFG, "upload"));
+    json_field(out, "undo", (int)undo_stack.size());
+    if (!undo_stack.empty())
+        json_field(out, "undo_title", undo_stack.back().title.c_str());
 
     if (playing)
     {
@@ -597,6 +701,7 @@ static void remove_entry(Playlist list, int entry)
                        list.get_position() == entry;
     bool was_paused = was_current && aud_drct_get_paused();
 
+    undo_remember(list, entry, 1);
     list.remove_entry(entry);
 
     if (!was_current || list.get_position() >= 0)
@@ -648,13 +753,41 @@ static Response api_command(const std::string & action, const Request & req)
             return error_response(400, "bad volume");
         aud_drct_set_volume_main(volume);
     }
-    else if (action == "shuffle" || action == "repeat")
+    else if (action == "shuffle")
     {
         if (has_param(req, "value"))
-            aud_set_bool(nullptr, action.c_str(), int_param(req, "value", 0));
+            aud_set_bool(nullptr, "shuffle", int_param(req, "value", 0));
         else
-            aud_toggle_bool(nullptr, action.c_str());
+            aud_toggle_bool(nullptr, "shuffle");
     }
+    else if (action == "repeat" || action == "repeat_one")
+    {
+        /* два режима повтора взаимно исключают друг друга */
+        bool one = action == "repeat_one";
+        bool repeat = aud_get_bool(nullptr, "repeat");
+        bool no_advance = aud_get_bool(nullptr, "no_playlist_advance");
+        bool current = repeat && (one ? no_advance : !no_advance);
+        bool enable = has_param(req, "value") ? int_param(req, "value", 0) != 0
+                                              : !current;
+
+        if (one && enable && !current)
+            /* запоминаем повтор плейлиста, чтобы вернуть его при выключении */
+            aud_set_bool(CFG, "repeat_before_one", repeat && !no_advance);
+
+        if (enable)
+        {
+            aud_set_bool(nullptr, "repeat", true);
+            aud_set_bool(nullptr, "no_playlist_advance", one);
+        }
+        else if (current)
+        {
+            aud_set_bool(nullptr, "no_playlist_advance", false);
+            aud_set_bool(nullptr, "repeat",
+                         one && aud_get_bool(CFG, "repeat_before_one"));
+        }
+    }
+    else if (action == "undo")
+        return api_undo();
     else if (action == "remove_current")
     {
         Playlist list = Playlist::playing_playlist();
@@ -717,7 +850,10 @@ static Response api_command(const std::string & action, const Request & req)
         else if (action == "playlist_delete")
             list.remove_playlist();
         else if (action == "playlist_clear")
+        {
+            undo_remember(list, 0, list.n_entries());
             list.remove_all_entries();
+        }
         else if (action == "add")
         {
             const char * uri = str_param(req, "uri");
@@ -784,6 +920,9 @@ static Response handle_api(const Request & req)
 
 static const size_t MAX_HEADER = 16 * 1024;
 static const size_t MAX_BODY = 64 * 1024;
+static const char UPLOAD_PATH[] = "/api/upload";
+static const unsigned long long UPLOAD_MAX = 2ULL * 1024 * 1024 * 1024;
+static const size_t MAX_CONNECTIONS = 200; /* браузер держит до 6 на вкладку */
 
 struct Connection
 {
@@ -821,7 +960,468 @@ static bool send_all(int fd, const char * data, size_t len)
     return true;
 }
 
-static void send_response(int fd, const Response & r, bool head_only)
+/* ------------------------------------------------------------------------ */
+/* Трансляция звука в MP3                                                    */
+/* ------------------------------------------------------------------------ */
+
+/* Звук приходит из потока воспроизведения (hook от эффект-плагина), в
+ * отдельном потоке кодируется LAME и раздаётся всем подключённым слушателям.
+ * Пока слушателей нет, ничего не копируется и не кодируется. Когда плеер
+ * стоит или на паузе, в поток идёт тишина, чтобы браузер не разрывал
+ * соединение.
+ *
+ * Формат потока постоянный (44,1 кГц, стерео, один битрейт), иначе браузеры
+ * спотыкаются на границе треков с разной частотой; пересчёт частоты
+ * выполняет сам LAME. */
+
+/* libmp3lame подгружается во время работы: заголовки для сборки не нужны,
+ * а без библиотеки плагин работает, просто без трансляции. */
+struct lame_global_flags;
+
+static struct
+{
+    void * lib;
+    lame_global_flags * (*init)();
+    int (*set_in_samplerate)(lame_global_flags *, int);
+    int (*set_out_samplerate)(lame_global_flags *, int);
+    int (*set_num_channels)(lame_global_flags *, int);
+    int (*set_brate)(lame_global_flags *, int);
+    int (*set_quality)(lame_global_flags *, int);
+    int (*set_bWriteVbrTag)(lame_global_flags *, int);
+    int (*set_disable_reservoir)(lame_global_flags *, int);
+    int (*init_params)(lame_global_flags *);
+    int (*encode)(lame_global_flags *, const float *, int, unsigned char *, int);
+    int (*flush)(lame_global_flags *, unsigned char *, int);
+    int (*close)(lame_global_flags *);
+} lame;
+
+static bool lame_load()
+{
+    if (lame.lib)
+        return true;
+
+    void * lib = dlopen("libmp3lame.so.0", RTLD_NOW | RTLD_LOCAL);
+    if (!lib)
+    {
+        AUDERR("Трансляция недоступна: %s\n", dlerror());
+        return false;
+    }
+
+    bool ok = true;
+    auto sym = [&](const char * name) {
+        void * p = dlsym(lib, name);
+        if (!p)
+        {
+            AUDERR("В libmp3lame нет функции %s\n", name);
+            ok = false;
+        }
+        return p;
+    };
+
+#define LAME_SYM(field, name) lame.field = (decltype(lame.field))sym(name)
+    LAME_SYM(init, "lame_init");
+    LAME_SYM(set_in_samplerate, "lame_set_in_samplerate");
+    LAME_SYM(set_out_samplerate, "lame_set_out_samplerate");
+    LAME_SYM(set_num_channels, "lame_set_num_channels");
+    LAME_SYM(set_brate, "lame_set_brate");
+    LAME_SYM(set_quality, "lame_set_quality");
+    LAME_SYM(set_bWriteVbrTag, "lame_set_bWriteVbrTag");
+    LAME_SYM(set_disable_reservoir, "lame_set_disable_reservoir");
+    LAME_SYM(init_params, "lame_init_params");
+    LAME_SYM(encode, "lame_encode_buffer_interleaved_ieee_float");
+    LAME_SYM(flush, "lame_encode_flush");
+    LAME_SYM(close, "lame_close");
+#undef LAME_SYM
+
+    if (!ok)
+    {
+        dlclose(lib);
+        return false;
+    }
+
+    lame.lib = lib;
+    return true;
+}
+
+static const int STREAM_RATE = 44100;
+static const size_t STREAM_CLIENT_MAX = 1024 * 1024; /* отставший слушатель */
+static const int STREAM_TICK_MS = 20;
+static const long long STREAM_CUSHION_US = 100000;    /* запас от заиканий */
+static const long long STREAM_QUEUE_MAX_US = 15000000;
+
+struct PcmSegment
+{
+    int rate;
+    std::vector<float> data; /* стерео */
+};
+
+struct StreamClient
+{
+    std::string buf;
+    bool dropped = false;
+};
+
+static std::mutex st_mutex;
+static std::condition_variable st_enc_cond;    /* будит кодировщик */
+static std::condition_variable st_client_cond; /* будит слушателей */
+static std::deque<PcmSegment> st_segments;
+static size_t st_front_pos = 0;   /* сколько кадров первого сегмента выдано */
+static long long st_queued_us = 0; /* длительность звука в очереди */
+static std::list<StreamClient *> st_clients;
+static std::atomic<int> st_n_clients{0};
+static bool st_quit = false;
+static std::thread st_thread;
+static std::atomic<bool> server_closing{false};
+
+/* вызывается из потока воспроизведения */
+static void stream_pcm_cb(void * data, void *)
+{
+    if (!st_n_clients.load(std::memory_order_relaxed))
+        return;
+
+    auto pcm = (const WebRemotePcm *)data;
+    int ch = pcm->channels;
+    int frames = pcm->samples / ch;
+    if (frames <= 0 || pcm->rate <= 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(st_mutex);
+
+    /* очередь не должна расти без конца — лучше пропуск, чем рост памяти */
+    if (st_queued_us > STREAM_QUEUE_MAX_US)
+        return;
+
+    if (st_segments.empty() || st_segments.back().rate != pcm->rate)
+        st_segments.push_back({pcm->rate, {}});
+
+    std::vector<float> & out = st_segments.back().data;
+    size_t pos = out.size();
+    out.resize(pos + (size_t)frames * 2);
+
+    const float * in = pcm->data;
+    for (int i = 0; i < frames; i++, in += ch)
+    {
+        /* моно дублируется, из многоканального берутся левый и правый */
+        out[pos++] = in[0];
+        out[pos++] = ch > 1 ? in[1] : in[0];
+    }
+
+    st_queued_us += (long long)frames * 1000000 / pcm->rate;
+}
+
+static void stream_clear_queue()
+{
+    st_segments.clear();
+    st_front_pos = 0;
+    st_queued_us = 0;
+}
+
+/* Плеер сбросил свой буфер (перемотка, переход к другому треку): звук,
+ * который мы держали в очереди, уже не прозвучит — выбрасываем и его. */
+static void stream_flush_cb(void *, void *)
+{
+    std::lock_guard<std::mutex> lock(st_mutex);
+    stream_clear_queue();
+}
+
+static lame_global_flags * encoder_open(int rate, int bitrate)
+{
+    lame_global_flags * enc = lame.init();
+    if (!enc)
+        return nullptr;
+
+    lame.set_in_samplerate(enc, rate);
+    lame.set_out_samplerate(enc, STREAM_RATE);
+    lame.set_num_channels(enc, 2);
+    lame.set_brate(enc, bitrate);
+    lame.set_quality(enc, 5);
+    lame.set_bWriteVbrTag(enc, 0);
+    /* без резервуара каждый кадр самодостаточен: слушатель может
+     * подключиться в любой момент, а кодировщик — пересоздаваться */
+    lame.set_disable_reservoir(enc, 1);
+
+    if (lame.init_params(enc) < 0)
+    {
+        lame.close(enc);
+        return nullptr;
+    }
+    return enc;
+}
+
+/* Поток кодировщика.
+ *
+ * Звук приходит от плеера с опережением: Audacious заполняет свой выходной
+ * буфер заранее, а при перемотке и смене трека выбрасывает его. Поэтому
+ * кодировщик не отправляет звук по мере поступления (иначе каждое
+ * переключение добавляло бы слушателю отставание на размер буфера), а
+ * держит его в очереди и выдаёт строго со скоростью реального времени —
+ * так же, как звуковая карта. Очередь повторяет выходной буфер плеера и
+ * сбрасывается вместе с ним, так что поток идёт вровень с колонками. Когда
+ * звука нет (стоп, пауза, очередь опустела), в поток идёт тишина. */
+static void encoder_loop()
+{
+    typedef std::chrono::steady_clock Clock;
+    using std::chrono::microseconds;
+
+    lame_global_flags * enc = nullptr;
+    int enc_rate = 0;
+    std::vector<unsigned char> mp3;
+    std::vector<float> pcm;
+    std::string encoded;
+
+    Clock::time_point last = Clock::now();
+    long long owed_us = 0;   /* сколько звука ещё нужно выдать */
+    bool rebuffering = true; /* после опустошения очереди копим запас */
+
+    std::unique_lock<std::mutex> lock(st_mutex);
+
+    while (!st_quit)
+    {
+        if (st_clients.empty())
+        {
+            stream_clear_queue();
+            if (enc)
+            {
+                lame.close(enc);
+                enc = nullptr;
+            }
+            st_enc_cond.wait(lock,
+                             [] { return st_quit || !st_clients.empty(); });
+            last = Clock::now();
+            owed_us = 0;
+            rebuffering = true;
+            continue;
+        }
+
+        st_enc_cond.wait_for(lock, std::chrono::milliseconds(STREAM_TICK_MS),
+                             [] { return st_quit; });
+        if (st_quit)
+            break;
+
+        /* состояние плеера спрашиваем без своей блокировки */
+        lock.unlock();
+        bool playing = aud_drct_get_playing();
+        bool paused = playing && aud_drct_get_paused();
+        lock.lock();
+
+        Clock::time_point now = Clock::now();
+        owed_us += std::chrono::duration_cast<microseconds>(now - last).count();
+        last = now;
+        if (owed_us > 500000) /* поток надолго заснул — не навёрстываем */
+            owed_us = 500000;
+
+        if (!playing)
+            stream_clear_queue();
+        if (rebuffering && st_queued_us >= STREAM_CUSHION_US)
+            rebuffering = false;
+
+        int rate;
+        pcm.clear();
+
+        if (!paused && !rebuffering && !st_segments.empty())
+        {
+            PcmSegment & seg = st_segments.front();
+            rate = seg.rate;
+
+            size_t want = (size_t)(owed_us * rate / 1000000);
+            size_t have = seg.data.size() / 2 - st_front_pos;
+            size_t take = std::min(want, have);
+
+            pcm.assign(seg.data.begin() + st_front_pos * 2,
+                       seg.data.begin() + (st_front_pos + take) * 2);
+
+            long long taken_us = (long long)take * 1000000 / rate;
+            owed_us -= taken_us;
+            st_queued_us = std::max(0LL, st_queued_us - taken_us);
+            st_front_pos += take;
+
+            if (take == have)
+            {
+                st_segments.pop_front();
+                st_front_pos = 0;
+                if (st_segments.empty())
+                {
+                    st_queued_us = 0;
+                    rebuffering = true;
+                }
+            }
+        }
+        else
+        {
+            rate = enc_rate ? enc_rate : STREAM_RATE;
+            size_t frames = (size_t)(owed_us * rate / 1000000);
+            pcm.assign(frames * 2, 0.0f);
+            owed_us -= (long long)frames * 1000000 / rate;
+        }
+
+        if (pcm.empty())
+            continue;
+
+        lock.unlock();
+
+        encoded.clear();
+        int frames = pcm.size() / 2;
+
+        if (!enc || rate != enc_rate)
+        {
+            mp3.resize(7200);
+            if (enc)
+            {
+                int n = lame.flush(enc, mp3.data(), mp3.size());
+                if (n > 0)
+                    encoded.append((const char *)mp3.data(), n);
+                lame.close(enc);
+            }
+            enc = encoder_open(rate, aud_get_int(CFG, "stream_bitrate"));
+            enc_rate = rate;
+        }
+
+        if (enc)
+        {
+            mp3.resize((size_t)frames * 5 / 4 + 7200);
+            int n = lame.encode(enc, pcm.data(), frames, mp3.data(), mp3.size());
+            if (n > 0)
+                encoded.append((const char *)mp3.data(), n);
+        }
+
+        lock.lock();
+
+        if (!encoded.empty())
+        {
+            for (StreamClient * client : st_clients)
+            {
+                if (client->buf.size() + encoded.size() > STREAM_CLIENT_MAX)
+                    client->dropped = true;
+                else
+                    client->buf += encoded;
+            }
+            st_client_cond.notify_all();
+        }
+    }
+
+    if (enc)
+        lame.close(enc);
+}
+
+/* обслуживает одного слушателя; выполняется в потоке его соединения */
+static void stream_serve(int fd, bool head_only)
+{
+    static const char head[] = "HTTP/1.1 200 OK\r\n"
+                               "Content-Type: audio/mpeg\r\n"
+                               "Cache-Control: no-store\r\n"
+                               "X-Content-Type-Options: nosniff\r\n"
+                               "Connection: close\r\n\r\n";
+
+    if (!send_all(fd, head, sizeof head - 1) || head_only)
+        return;
+
+    StreamClient client;
+    std::unique_lock<std::mutex> lock(st_mutex);
+    st_clients.push_back(&client);
+    st_n_clients++;
+    st_enc_cond.notify_all();
+
+    std::string chunk;
+    for (;;)
+    {
+        st_client_cond.wait_for(lock, std::chrono::milliseconds(500), [&] {
+            return !client.buf.empty() || client.dropped || st_quit;
+        });
+        if (client.dropped || st_quit || server_closing)
+            break;
+        if (client.buf.empty())
+            continue;
+
+        chunk.clear();
+        chunk.swap(client.buf);
+
+        lock.unlock();
+        bool sent = send_all(fd, chunk.data(), chunk.size());
+        lock.lock();
+
+        if (!sent)
+            break;
+    }
+
+    st_clients.remove(&client);
+    st_n_clients--;
+}
+
+static void stream_stop()
+{
+    if (!stream_running)
+        return;
+
+    stream_running = false;
+    hook_dissociate(WEBREMOTE_PCM_HOOK, stream_pcm_cb);
+    hook_dissociate(WEBREMOTE_FLUSH_HOOK, stream_flush_cb);
+
+    {
+        std::lock_guard<std::mutex> lock(st_mutex);
+        st_quit = true;
+    }
+    st_enc_cond.notify_all();
+    st_client_cond.notify_all();
+    st_thread.join();
+}
+
+static void stream_start()
+{
+    if (stream_running || !lame_load())
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(st_mutex);
+        st_quit = false;
+    }
+    st_thread = std::thread(encoder_loop);
+    hook_associate(WEBREMOTE_PCM_HOOK, stream_pcm_cb, nullptr);
+    hook_associate(WEBREMOTE_FLUSH_HOOK, stream_flush_cb, nullptr);
+    stream_running = true;
+}
+
+/* включает или выключает эффект-плагин, отводящий звук */
+static void stream_enable_tap(bool enable)
+{
+    PluginHandle * tap = aud_plugin_lookup_basename(WEBREMOTE_STREAM_BASENAME);
+    if (!tap)
+    {
+        if (enable)
+            AUDERR("Не найден плагин " WEBREMOTE_STREAM_BASENAME
+                   ".so — трансляция будет молчать\n");
+        return;
+    }
+    if (aud_plugin_get_enabled(tap) != enable)
+        aud_plugin_enable(tap, enable);
+}
+
+/* Трансляция доступна, когда работает кодировщик и включён эффект,
+ * отводящий звук, — неважно, галочкой в настройках Web Remote или прямо
+ * в списке эффектов Audacious. */
+static bool stream_available()
+{
+    if (!stream_running)
+        return false;
+    PluginHandle * tap = aud_plugin_lookup_basename(WEBREMOTE_STREAM_BASENAME);
+    return tap && aud_plugin_get_enabled(tap);
+}
+
+static void stream_config_changed()
+{
+    stream_enable_tap(aud_get_bool(CFG, "stream"));
+}
+
+/* при запуске приводит галочку и эффект к одному состоянию */
+static void stream_sync_tap()
+{
+    if (aud_get_bool(CFG, "stream"))
+        stream_enable_tap(true);
+    else if (stream_available())
+        aud_set_bool(CFG, "stream", true);
+}
+
+static bool send_response(int fd, const Response & r, bool head_only,
+                          bool keep_alive = false)
 {
     std::string head = "HTTP/1.1 " + std::to_string(r.code) + " " +
                        status_text(r.code) + "\r\n";
@@ -831,17 +1431,19 @@ static void send_response(int fd, const Response & r, bool head_only)
                         : "Cache-Control: no-store\r\n";
     if (r.code == 401)
         head += "WWW-Authenticate: Basic realm=\"Audacious\", charset=\"UTF-8\"\r\n";
-    head += "X-Content-Type-Options: nosniff\r\n"
-            "Connection: close\r\n\r\n";
+    head += "X-Content-Type-Options: nosniff\r\n";
+    head += keep_alive ? "Connection: keep-alive\r\n\r\n"
+                       : "Connection: close\r\n\r\n";
 
-    if (send_all(fd, head.data(), head.size()) && !head_only)
-        send_all(fd, r.body.data(), r.body.size());
+    if (!send_all(fd, head.data(), head.size()))
+        return false;
+    return head_only || send_all(fd, r.body.data(), r.body.size());
 }
 
-/* читает и разбирает запрос; при ошибке возвращает код HTTP, иначе 0 */
-static int read_request(int fd, Request & req)
+/* Читает и разбирает запрос; при ошибке возвращает код HTTP, иначе 0.
+ * <buf> хранит прочитанное между запросами одного соединения. */
+static int read_request(int fd, Request & req, std::string & buf)
 {
-    std::string buf;
     size_t header_end;
     char chunk[4096];
 
@@ -851,7 +1453,7 @@ static int read_request(int fd, Request & req)
             return 413;
         ssize_t n = recv(fd, chunk, sizeof chunk, 0);
         if (n <= 0)
-            return -1; /* клиент ничего не прислал — молча закрываем */
+            return -1; /* клиент молчит или ушёл — закрываем без ответа */
         buf.append(chunk, n);
     }
 
@@ -863,6 +1465,7 @@ static int read_request(int fd, Request & req)
         return 400;
 
     req.method = line.substr(0, sp1);
+    req.http10 = line.compare(sp2 + 1, std::string::npos, "HTTP/1.0") == 0;
     std::string target = line.substr(sp1 + 1, sp2 - sp1 - 1);
     size_t q = target.find('?');
     req.path = target.substr(0, q);
@@ -893,24 +1496,33 @@ static int read_request(int fd, Request & req)
     {
         char * end;
         unsigned long long len = strtoull(it->second.c_str(), &end, 10);
-        if (*end || len > MAX_BODY)
+        if (*end || len > (req.path == UPLOAD_PATH ? UPLOAD_MAX : MAX_BODY))
             return 413;
         body_len = len;
     }
 
-    std::string body = buf.substr(header_end + 4);
-    while (body.size() < body_len)
+    /* файл не читается в память: его тело обработчик загрузки пишет на
+     * диск по мере поступления */
+    if (req.path == UPLOAD_PATH)
+    {
+        req.body_len = body_len;
+        buf.erase(0, header_end + 4);
+        return 0;
+    }
+
+    size_t total = header_end + 4 + body_len;
+    while (buf.size() < total)
     {
         ssize_t n = recv(fd, chunk, sizeof chunk, 0);
         if (n <= 0)
             return -1;
-        body.append(chunk, n);
+        buf.append(chunk, n);
     }
-    body.resize(body_len);
 
     if (body_len)
-        parse_form(body, req.params);
+        parse_form(buf.substr(header_end + 4, body_len), req.params);
 
+    buf.erase(0, total);
     return 0;
 }
 
@@ -953,6 +1565,216 @@ static bool check_origin(const Request & req)
     return scheme != std::string::npos && o.substr(scheme + 3) == host->second;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Загрузка файлов                                                           */
+/* ------------------------------------------------------------------------ */
+
+/* Страница присылает файл телом POST-запроса /api/upload?name=…&pl=N.
+ * Файл сохраняется в папку загрузок и добавляется в плейлист. Имя файла
+ * приходит от клиента, поэтому из него берётся только последняя часть пути,
+ * а расширение должно быть из списка звуковых форматов: записать что-то за
+ * пределы папки или положить туда произвольный файл нельзя. */
+
+static const char * const upload_exts[] = {"mp3", "wav", "flac", "xm", "s3m",
+                                           "mod", "it",  "ogg",  "opus", "m4a"};
+
+static std::string upload_dir()
+{
+    String dir = aud_get_str(CFG, "upload_dir");
+    if (dir && dir[0])
+    {
+        /* виджет выбора папки сохраняет адрес file:// */
+        if (!strncmp(dir, "file://", 7))
+        {
+            StringBuf path = uri_to_filename(dir);
+            if (path)
+                return std::string(path);
+        }
+        else
+            return std::string(dir);
+    }
+
+    const char * home = getenv("HOME");
+    return std::string(home ? home : "/tmp") + "/Music/Audacious Web";
+}
+
+static bool make_dirs(const std::string & dir)
+{
+    for (size_t pos = 1; pos <= dir.size(); pos++)
+    {
+        if (pos < dir.size() && dir[pos] != '/')
+            continue;
+        if (mkdir(dir.substr(0, pos).c_str(), 0755) < 0 && errno != EEXIST)
+            return false;
+    }
+    return true;
+}
+
+/* возвращает безопасное имя файла или пустую строку */
+static std::string upload_name(const std::string & raw)
+{
+    size_t slash = raw.find_last_of("/\\");
+    std::string name = slash == std::string::npos ? raw : raw.substr(slash + 1);
+
+    for (char & c : name)
+        if ((unsigned char)c < 0x20 || c == 0x7f)
+            c = '_';
+
+    if (name.empty() || name[0] == '.' || name.size() > 200)
+        return std::string();
+
+    size_t dot = name.rfind('.');
+    if (dot == std::string::npos)
+        return std::string();
+
+    std::string ext = name.substr(dot + 1);
+    for (char & c : ext)
+        if (c >= 'A' && c <= 'Z')
+            c += 'a' - 'A';
+
+    for (const char * allowed : upload_exts)
+        if (ext == allowed)
+            return name;
+    return std::string();
+}
+
+/* читает и отбрасывает тело запроса, чтобы клиент дождался ответа с ошибкой */
+static bool discard_body(int fd, std::string & pending, size_t len)
+{
+    if (len > 256 * 1024 * 1024)
+        return false; /* проще разорвать соединение */
+
+    size_t have = std::min(pending.size(), len);
+    pending.erase(0, have);
+    len -= have;
+
+    char chunk[65536];
+    while (len)
+    {
+        ssize_t n = recv(fd, chunk, std::min(len, sizeof chunk), 0);
+        if (n <= 0)
+            return false;
+        len -= n;
+    }
+    return true;
+}
+
+/* <consumed> — прочитано ли тело целиком (иначе соединение надо закрыть) */
+static Response handle_upload(int fd, const Request & req, std::string & pending,
+                              bool & consumed)
+{
+    static std::atomic<int> counter{0};
+
+    Response error;
+    std::string name;
+
+    if (!check_auth(req))
+        error = error_response(401, "unauthorized");
+    else if (req.method != "POST")
+        error = error_response(405, "method not allowed");
+    else if (!check_origin(req))
+        error = error_response(403, "cross-origin request rejected");
+    else if (!aud_get_bool(CFG, "upload"))
+        error = error_response(403, "uploads are disabled");
+    else if (!req.body_len)
+        error = error_response(400, "empty file");
+    else if ((name = upload_name(str_param(req, "name"))).empty())
+        error = error_response(415, "unsupported file type");
+
+    if (error.code != 200)
+    {
+        consumed = discard_body(fd, pending, req.body_len);
+        return error;
+    }
+
+    consumed = false;
+
+    std::string dir = upload_dir();
+    if (!make_dirs(dir))
+        return error_response(500, "cannot create upload folder");
+
+    /* сначала во временный файл: недокачанное не должно выглядеть как трек */
+    std::string tmp = dir + "/.upload-" + std::to_string(getpid()) + "-" +
+                      std::to_string(counter++) + ".part";
+    int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (out < 0)
+        return error_response(500, "cannot write to upload folder");
+
+    auto write_all = [out](const char * data, size_t len) {
+        while (len)
+        {
+            ssize_t n = write(out, data, len);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                return false;
+            data += n;
+            len -= n;
+        }
+        return true;
+    };
+
+    size_t left = req.body_len;
+    size_t have = std::min(pending.size(), left);
+    bool ok = write_all(pending.data(), have);
+    pending.erase(0, have);
+    left -= have;
+
+    bool disk_error = !ok;
+    char chunk[65536];
+    while (ok && left)
+    {
+        ssize_t n = recv(fd, chunk, std::min(left, sizeof chunk), 0);
+        if (n <= 0)
+            ok = false; /* клиент пропал или прервал загрузку */
+        else if (!write_all(chunk, n))
+            ok = false, disk_error = true;
+        else
+            left -= n;
+    }
+
+    if (close(out) < 0)
+        ok = false, disk_error = true;
+
+    if (!ok)
+    {
+        unlink(tmp.c_str());
+        return error_response(disk_error ? 500 : 400,
+                              disk_error ? "write failed" : "upload interrupted");
+    }
+
+    consumed = true;
+
+    /* имя не должно затирать существующий файл: «песня (2).mp3» */
+    size_t dot = name.rfind('.');
+    std::string path = dir + "/" + name;
+    for (int i = 2; access(path.c_str(), F_OK) == 0 && i < 1000; i++)
+        path = dir + "/" + name.substr(0, dot) + " (" + std::to_string(i) + ")" +
+               name.substr(dot);
+
+    if (rename(tmp.c_str(), path.c_str()) < 0)
+    {
+        unlink(tmp.c_str());
+        return error_response(500, "cannot save file");
+    }
+
+    return run_in_main([req, path] {
+        Playlist list;
+        if (!get_playlist(req, list))
+            list = Playlist::active_playlist();
+        list.insert_entry(-1, filename_to_uri(path.c_str()), Tuple(), false);
+
+        std::string out = "{\"ok\":true,";
+        json_field(out, "file", path.c_str());
+        json_field(out, "pl", list.index());
+        json_close(out, '}');
+
+        Response r;
+        r.body = std::move(out);
+        return r;
+    });
+}
+
 static Response handle_request(const Request & req)
 {
     if (!check_auth(req))
@@ -981,22 +1803,77 @@ static Response handle_request(const Request & req)
     return run_in_main([req] { return handle_api(req); });
 }
 
+/* клиент просит закрыть соединение после ответа */
+static bool wants_close(const Request & req)
+{
+    auto it = req.headers.find("connection");
+    if (it == req.headers.end())
+        return req.http10;
+
+    std::string value = it->second;
+    for (char & c : value)
+        if (c >= 'A' && c <= 'Z')
+            c += 'a' - 'A';
+    return value.find("close") != std::string::npos ||
+           (req.http10 && value.find("keep-alive") == std::string::npos);
+}
+
 static void serve_connection(Connection * conn)
 {
     int fd = conn->fd;
 
-    struct timeval tv = {10, 0};
+    /* столько соединение ждёт следующего запроса и столько же — записи */
+    struct timeval tv = {20, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
-    Request req;
-    int err = read_request(fd, req);
-    if (err > 0)
-        send_response(fd, error_response(err, "bad request"), false);
-    else if (!err)
-        send_response(fd, handle_request(req), req.method == "HEAD");
+    /* Клиент может пропасть, не закрыв соединение (телефон вышел из зоны
+     * Wi-Fi). Без этих настроек ядро ещё минутами пытается доставить ему
+     * данные, а трансляция продолжает их копить. */
+    int idle = 10, interval = 5, probes = 3, unacked_ms = 20000;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof interval);
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof probes);
+    setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &unacked_ms, sizeof unacked_ms);
+
+    /* Соединение обслуживает запросы один за другим (keep-alive): страница
+     * опрашивает состояние каждую секунду, и открывать для этого каждый раз
+     * новое соединение по Wi-Fi медленно и ненадёжно. */
+    std::string pending;
+    for (;;)
+    {
+        Request req;
+        int err = read_request(fd, req, pending);
+        if (err > 0)
+            send_response(fd, error_response(err, "bad request"), false);
+        if (err)
+            break;
+
+        bool head_only = req.method == "HEAD";
+        if (req.path == "/stream.mp3" && (req.method == "GET" || head_only) &&
+            check_auth(req) && stream_running)
+        {
+            stream_serve(fd, head_only); /* до отключения слушателя */
+            break;
+        }
+
+        bool keep = !wants_close(req) && !server_closing;
+        Response response;
+        if (req.path == UPLOAD_PATH)
+        {
+            bool consumed = false;
+            response = handle_upload(fd, req, pending, consumed);
+            keep = keep && consumed;
+        }
+        else
+            response = handle_request(req);
+
+        if (!send_response(fd, response, head_only, keep) || !keep)
+            break;
+    }
 
     {
         std::lock_guard<std::mutex> lock(conn_mutex);
@@ -1044,7 +1921,7 @@ static void accept_loop()
             continue;
 
         std::lock_guard<std::mutex> lock(conn_mutex);
-        if (conns.size() >= 64)
+        if (conns.size() >= MAX_CONNECTIONS)
         {
             close(fd);
             continue;
@@ -1096,6 +1973,7 @@ static bool server_start()
 
     running_port = port;
     running_remote = remote;
+    server_closing = false;
     accept_thread = std::thread(accept_loop);
 
     AUDINFO("Web Remote: http://%s:%d/\n", remote ? "0.0.0.0" : "127.0.0.1",
@@ -1117,6 +1995,9 @@ static void server_stop()
     }
     job_cond.notify_all();
     job_runner.stop();
+
+    server_closing = true; /* отпускает слушателей трансляции */
+    st_client_cond.notify_all();
 
     if (write(wake_pipe[1], "x", 1) < 0)
         AUDERR("write: %s\n", strerror(errno));
@@ -1153,6 +2034,8 @@ static void config_changed()
 
 /* ------------------------------------------------------------------------ */
 
+static QueuedFunc stream_init_timer;
+
 bool WebRemote::init()
 {
     aud_config_set_defaults(CFG, defaults);
@@ -1161,11 +2044,19 @@ bool WebRemote::init()
     /* Если порт занят, плагин всё равно включается, чтобы порт можно было
      * сменить в настройках. */
     server_start();
+
+    /* Эффект включается не сразу, а когда заработает главный цикл: во время
+     * init() Audacious ещё может загружать плагины. */
+    stream_start(); /* без слушателей кодировщик простаивает */
+    stream_init_timer.queue(stream_sync_tap);
     return true;
 }
 
 void WebRemote::cleanup()
 {
+    stream_init_timer.stop();
     server_stop();
+    undo_stack.clear();
+    stream_stop();
     hook_dissociate("playlist update", playlist_update_cb);
 }
