@@ -148,6 +148,14 @@ input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; mar
 #toast button { color: var(--accent); font-weight: 600; padding: 4px 10px; min-height: 30px; }
 body.drag #list { outline: 2px dashed var(--accent); outline-offset: -6px; }
 #toast.err { border-color: var(--danger); }
+#dlmenu {
+  position: fixed; z-index: 10; display: flex; flex-direction: column; padding: 4px;
+  background: var(--raised); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.35);
+}
+#dlmenu[hidden] { display: none; }
+#dlmenu button { justify-content: flex-start; padding: 8px 14px; white-space: nowrap; }
+#dlmenu small { color: var(--dim); }
 
 @media (max-width: 640px) {
   #now { padding: 10px 12px; gap: 8px 12px; }
@@ -224,6 +232,10 @@ body.drag #list { outline: 2px dashed var(--accent); outline-offset: -6px; }
 <main id="list"><div id="rows"></div><div id="empty" hidden></div></main>
 <footer id="status">Подключение…</footer>
 <div id="toast" role="status"></div>
+<div id="dlmenu" role="menu" hidden>
+  <button data-fmt="orig" role="menuitem">Оригинальный файл</button>
+  <button data-fmt="mp3" role="menuitem">В MP3 <small>(рендеринг)</small></button>
+</div>
 
 <script>
 'use strict';
@@ -288,7 +300,7 @@ function applyStreamVolume() { liveAudio.volume = (streamVolume / 100) ** 2; }
 let artKey = null;
 
 /* ---- сеть ---- */
-async function api(path, params) {
+async function api(path, params, timeoutMs = 6000) {
   const opts = params === undefined ? {} : {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
@@ -297,7 +309,7 @@ async function api(path, params) {
   // Без ограничения по времени запрос, отправленный в момент обрыва Wi-Fi,
   // может висеть минутами — и всё это время страница не обновлялась бы.
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 6000);
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
   let res, data;
   try {
     res = await fetch('api/' + path, {...opts, signal: ctl.signal});
@@ -568,7 +580,7 @@ rowsEl.addEventListener('click', async e => {
   if (!btn)
     return plCmd('jump', {entry});
   if (btn.dataset.act === 'download')
-    return download(view, entry, list.sserial);
+    return openDlMenu(btn, view, entry, list.sserial);
   if (btn.dataset.act === 'queue')
     return plCmd('queue', {entry});
   if (btn.dataset.act === 'remove') {
@@ -728,8 +740,78 @@ async function download(pl, entry, sserial) {
 }
 setup('dlcur', 'download', () => {
   const t = status && status.track;
-  if (t) download(status.playing, t.entry, status.sserial);
+  if (t) openDlMenu($('dlcur'), status.playing, t.entry, status.sserial);
 });
+
+/* ---- скачивание в MP3 ----
+ * Сервер прогоняет трек через Audacious и кодирует в MP3 — так скачиваются
+ * и трекерные модули, и MIDI, и всё остальное, что он умеет играть.
+ * Рендеринг идёт быстрее реального времени, но для длинных треков и MIDI
+ * с большими звуковыми шрифтами может занять заметное время. */
+let rendering = false;
+async function renderMp3(pl, entry, sserial) {
+  if (rendering) return toast('Дождитесь окончания текущего рендеринга', true);
+  rendering = true;
+  const el = $('toast'), started = Date.now();
+  const show = () => {
+    clearTimeout(toastTimer);
+    el.textContent = `Рендеринг в MP3… ${Math.round((Date.now() - started) / 1000)} с`;
+    el.className = 'show';
+  };
+  show();
+  const ticker = setInterval(show, 1000);
+  try {
+    const info = await api('render', {pl, entry, sserial}, 11 * 60 * 1000);
+    const a = document.createElement('a');
+    a.href = 'api/render_get?token=' + encodeURIComponent(info.token);
+    a.download = info.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    clearInterval(ticker);
+    toast(`Скачивается: ${info.name} (${(info.size / 1048576).toFixed(1).replace('.', ',')} МБ)`);
+  } catch (e) {
+    clearInterval(ticker);
+    const why = {409: 'плейлист изменился, повторите', 415: 'это не файл на диске (поток или адрес в сети)',
+                 503: 'сервер занят другим рендерингом, повторите позже',
+                 403: 'скачивание выключено в настройках'}[e.code] || e.message;
+    toast('Не удалось сделать MP3: ' + why, true);
+    if (e.code === 409) poll(true);
+  } finally {
+    rendering = false;
+  }
+}
+
+// меню выбора формата у кнопки скачивания
+let dlTarget = null;
+function openDlMenu(anchor, pl, entry, sserial) {
+  const menu = $('dlmenu');
+  if (!menu.hidden && dlTarget && dlTarget.anchor === anchor) return closeDlMenu();
+  dlTarget = {anchor, pl, entry, sserial};
+  menu.hidden = false;
+  const r = anchor.getBoundingClientRect(), m = menu.getBoundingClientRect();
+  const below = r.bottom + m.height + 8 < window.innerHeight;
+  menu.style.top = (below ? r.bottom + 4 : r.top - m.height - 4) + 'px';
+  menu.style.left = Math.max(8, Math.min(r.right - m.width, window.innerWidth - m.width - 8)) + 'px';
+  menu.querySelector('button').focus();
+}
+function closeDlMenu() {
+  $('dlmenu').hidden = true;
+  dlTarget = null;
+}
+$('dlmenu').addEventListener('click', e => {
+  const item = e.target.closest('button');
+  if (!item || !dlTarget) return;
+  const {pl, entry, sserial} = dlTarget;
+  closeDlMenu();
+  if (item.dataset.fmt === 'mp3') renderMp3(pl, entry, sserial);
+  else download(pl, entry, sserial);
+});
+document.addEventListener('mousedown', e => {
+  if (dlTarget && !e.target.closest('#dlmenu') && e.target.closest('button') !== dlTarget.anchor) closeDlMenu();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && dlTarget) closeDlMenu(); });
+listEl.addEventListener('scroll', () => { if (dlTarget) closeDlMenu(); }, {passive: true});
 
 setup('removecur', 'trash', async () => {
   const t = status && status.track;

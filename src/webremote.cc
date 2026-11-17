@@ -16,12 +16,19 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <dirent.h>
+#include <signal.h>
+#include <spawn.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <fstream>
+#include <random>
+#include <sstream>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -93,6 +100,7 @@ const char * const WebRemote::defaults[] = {"port",   "8421", "remote",
                                             "stream", "FALSE", "stream_bitrate",
                                             "192",    "upload", "TRUE",
                                             "download", "TRUE",
+                                            "render_bitrate", "256",
                                             "upload_dir", "", "upload_exts", "",
                                             nullptr};
 
@@ -114,6 +122,9 @@ const PreferencesWidget WebRemote::widgets[] = {
                 "применяется со следующего трека."),
     WidgetCheck("Разрешить скачивание треков со страницы",
                 WidgetBool(CFG, "download")),
+    WidgetSpin("Битрейт при скачивании в MP3:",
+               WidgetInt(CFG, "render_bitrate"), {64, 320, 32, "кбит/с"},
+               WIDGET_CHILD),
     WidgetCheck("Разрешить загрузку файлов со страницы",
                 WidgetBool(CFG, "upload")),
     WidgetFileEntry("Папка для загруженных файлов:",
@@ -2008,23 +2019,11 @@ static Response download_resolve(const Request & req)
     return r;
 }
 
-/* возвращает false, если соединение нужно закрыть */
-static bool serve_download(int fd, const Request & req, bool keep)
+/* Отдаёт файл как вложение под именем <name>. Возвращает false, если
+ * соединение нужно закрыть. */
+static bool send_file(int fd, const std::string & path, const std::string & name,
+                      bool keep)
 {
-    Response r;
-    if (!check_auth(req))
-        r = error_response(401, "unauthorized");
-    else if (req.method != "GET")
-        r = error_response(405, "method not allowed");
-    else if (!aud_get_bool(CFG, "download"))
-        r = error_response(403, "downloads are disabled");
-    else
-        r = run_in_main([req] { return download_resolve(req); });
-
-    if (r.code != 200)
-        return send_response(fd, r, false, keep) && keep;
-
-    std::string path = r.body;
     int in = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     struct stat st;
     if (in < 0 || fstat(in, &st) < 0 || !S_ISREG(st.st_mode))
@@ -2033,21 +2032,6 @@ static bool serve_download(int fd, const Request & req, bool keep)
             close(in);
         return send_response(fd, error_response(404, "file is not available"),
                              false, keep) && keep;
-    }
-
-    size_t slash = path.rfind('/');
-    std::string name = path.substr(slash + 1);
-
-    if (has_param(req, "check"))
-    {
-        close(in);
-        std::string out = "{\"ok\":true,";
-        json_field(out, "name", name.c_str());
-        json_field(out, "size", (long long)st.st_size);
-        json_close(out, '}');
-        Response info;
-        info.body = std::move(out);
-        return send_response(fd, info, false, keep) && keep;
     }
 
     /* имя файла в заголовке — в кодировке RFC 5987, иначе кириллица ломается */
@@ -2090,6 +2074,528 @@ static bool serve_download(int fd, const Request & req, bool keep)
 
     close(in);
     return ok && keep;
+}
+
+
+/* возвращает false, если соединение нужно закрыть */
+static bool serve_download(int fd, const Request & req, bool keep)
+{
+    Response r;
+    if (!check_auth(req))
+        r = error_response(401, "unauthorized");
+    else if (req.method != "GET")
+        r = error_response(405, "method not allowed");
+    else if (!aud_get_bool(CFG, "download"))
+        r = error_response(403, "downloads are disabled");
+    else
+        r = run_in_main([req] { return download_resolve(req); });
+
+    if (r.code != 200)
+        return send_response(fd, r, false, keep) && keep;
+
+    std::string path = r.body;
+    int in = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (in < 0 || fstat(in, &st) < 0 || !S_ISREG(st.st_mode))
+    {
+        if (in >= 0)
+            close(in);
+        return send_response(fd, error_response(404, "file is not available"),
+                             false, keep) && keep;
+    }
+
+    size_t slash = path.rfind('/');
+    std::string name = path.substr(slash + 1);
+
+    if (has_param(req, "check"))
+    {
+        close(in);
+        std::string out = "{\"ok\":true,";
+        json_field(out, "name", name.c_str());
+        json_field(out, "size", (long long)st.st_size);
+        json_close(out, '}');
+        Response info;
+        info.body = std::move(out);
+        return send_response(fd, info, false, keep) && keep;
+    }
+
+    close(in);
+    return send_file(fd, path, name, keep);
+}
+
+
+/* ------------------------------------------------------------------------ */
+/* Скачивание в MP3 (рендеринг)                                              */
+/* ------------------------------------------------------------------------ */
+
+/* Декодеры Audacious доступны только через воспроизведение, поэтому трек
+ * рендерится отдельным скрытым экземпляром Audacious: тот же исполняемый
+ * файл, копия настроек пользователя (звуковые шрифты MIDI, параметры
+ * трекерных модулей и т.п.) и единственный модуль вывода — FileWriter,
+ * который пишет MP3 быстрее реального времени. Так в MP3 превращается всё,
+ * что умеет играть Audacious.
+ *
+ * Вспомогательный экземпляр работает в своей временной папке, без D-Bus
+ * (чтобы не перехватить управление у основного), без интерфейса, эффектов
+ * и общих модулей, и сам завершается после трека (-q). Готовый файл
+ * хранится до скачивания, но не дольше RENDER_KEEP_S. */
+
+static const int RENDER_MAX_JOBS = 2;
+static const int RENDER_TIMEOUT_S = 600;
+static const long long RENDER_MAX_BYTES = 500LL * 1024 * 1024;
+static const int RENDER_KEEP_S = 900;
+static const char RENDER_PREFIX[] = "audacious-web-render-";
+
+struct RenderResult
+{
+    std::string dir, file, name;
+    std::chrono::steady_clock::time_point made;
+};
+
+static std::mutex render_mutex;
+static std::map<std::string, RenderResult> render_results; /* по токену */
+static int render_jobs = 0;
+
+static std::string temp_base()
+{
+    const char * tmp = getenv("TMPDIR");
+    return tmp && tmp[0] == '/' ? tmp : "/tmp";
+}
+
+static void remove_tree(const std::string & path)
+{
+    DIR * dir = opendir(path.c_str());
+    if (dir)
+    {
+        while (struct dirent * e = readdir(dir))
+        {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+                continue;
+            std::string child = path + "/" + e->d_name;
+            struct stat st;
+            if (lstat(child.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                remove_tree(child);
+            else
+                unlink(child.c_str());
+        }
+        closedir(dir);
+    }
+    rmdir(path.c_str());
+}
+
+/* --- копия настроек для вспомогательного экземпляра --- */
+
+typedef std::vector<std::pair<std::string, std::string>> IniSection;
+typedef std::vector<std::pair<std::string, IniSection>> Ini;
+
+static Ini ini_read(const std::string & path)
+{
+    Ini ini;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.size() > 1 && line[0] == '[' && line.back() == ']')
+            ini.push_back({line.substr(1, line.size() - 2), {}});
+        else if (!ini.empty())
+        {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos)
+                ini.back().second.push_back({line.substr(0, eq), line.substr(eq + 1)});
+        }
+    }
+    return ini;
+}
+
+static void ini_set(Ini & ini, const char * section, const char * key,
+                    const std::string & value)
+{
+    for (auto & sec : ini)
+    {
+        if (sec.first != section)
+            continue;
+        for (auto & kv : sec.second)
+            if (kv.first == key)
+            {
+                kv.second = value;
+                return;
+            }
+        sec.second.push_back({key, value});
+        return;
+    }
+    ini.push_back({section, {{key, value}}});
+}
+
+static bool ini_write(const Ini & ini, const std::string & path)
+{
+    std::ofstream out(path);
+    for (auto & sec : ini)
+    {
+        out << '[' << sec.first << "]\n";
+        for (auto & kv : sec.second)
+            out << kv.first << '=' << kv.second << '\n';
+        out << '\n';
+    }
+    return (bool)out;
+}
+
+/* реестр модулей: из вывода включён только FileWriter, а интерфейс, общие
+ * модули (в том числе этот), эффекты и визуализация выключены */
+static bool registry_write(const std::string & from, const std::string & to)
+{
+    std::ifstream in(from);
+    std::ofstream out(to);
+    if (!in || !out)
+        return false;
+
+    std::string line, type, path;
+    while (std::getline(in, line))
+    {
+        size_t sp = line.find(' ');
+        if (sp != std::string::npos && sp + 1 < line.size() && line[sp + 1] == '/' &&
+            line.find_first_not_of("abcdefghijklmnopqrstuvwxyz") == sp)
+        {
+            type = line.substr(0, sp);
+            path = line.substr(sp + 1);
+        }
+        else if (!line.compare(0, 8, "enabled ") &&
+                 (type == "output" || type == "general" || type == "effect" ||
+                  type == "vis" || type == "iface"))
+        {
+            bool filewriter = type == "output" && path.size() >= 14 &&
+                              !path.compare(path.size() - 14, 14, "/filewriter.so");
+            line = filewriter ? "enabled 1" : "enabled 0";
+        }
+        out << line << '\n';
+    }
+    return (bool)out;
+}
+
+struct RenderJob
+{
+    std::string uri, name, bin, user_dir;
+    int bitrate;
+};
+
+static bool render_prepare(const RenderJob & job, const std::string & dir)
+{
+    std::string cfg = dir + "/cfg/audacious-8";
+    if (!make_dirs(cfg) || !make_dirs(dir + "/out"))
+        return false;
+
+    Ini ini = ini_read(job.user_dir + "/config");
+
+    /* звук как в файле: без эквалайзера, громкости и выравнивания */
+    for (const char * key : {"equalizer_active", "software_volume_control",
+                             "enable_replay_gain", "repeat", "shuffle",
+                             "no_playlist_advance", "stop_after_current_song",
+                             "resume_playback_on_startup"})
+        ini_set(ini, "audacious", key, "FALSE");
+
+    ini_set(ini, "filewriter", "fileext", "1"); /* MP3 */
+    ini_set(ini, "filewriter", "file_path",
+            (const char *)filename_to_uri((dir + "/out").c_str()));
+    ini_set(ini, "filewriter", "save_original", "FALSE");
+    ini_set(ini, "filewriter", "filenamefromtags", "FALSE");
+    ini_set(ini, "filewriter", "use_suffix", "FALSE");
+    ini_set(ini, "filewriter", "prependnumber", "FALSE");
+    ini_set(ini, "filewriter_mp3", "bitrate_val", std::to_string(job.bitrate));
+    ini_set(ini, "filewriter_mp3", "vbr_on", "0");
+
+    return ini_write(ini, cfg + "/config") &&
+           registry_write(job.user_dir + "/plugin-registry", cfg + "/plugin-registry");
+}
+
+/* единственный файл в папке вывода; пустая строка, если его нет */
+static std::string render_output(const std::string & out_dir, long long * size)
+{
+    std::string found;
+    *size = 0;
+    DIR * dir = opendir(out_dir.c_str());
+    if (!dir)
+        return found;
+    while (struct dirent * e = readdir(dir))
+    {
+        if (e->d_name[0] == '.')
+            continue;
+        struct stat st;
+        std::string path = out_dir + "/" + e->d_name;
+        if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode))
+        {
+            found = path;
+            *size += st.st_size;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+extern char ** environ;
+
+/* запускает вспомогательный экземпляр и ждёт его; возвращает путь к MP3
+ * или пустую строку, <error> — причина */
+static std::string render_run(const RenderJob & job, const std::string & dir,
+                              std::string & error)
+{
+    std::vector<std::string> env_store;
+    for (char ** e = environ; *e; e++)
+        if (strncmp(*e, "XDG_CONFIG_HOME=", 16) &&
+            strncmp(*e, "DBUS_SESSION_BUS_ADDRESS=", 25))
+            env_store.push_back(*e);
+    env_store.push_back("XDG_CONFIG_HOME=" + dir + "/cfg");
+    env_store.push_back("DBUS_SESSION_BUS_ADDRESS=disabled:");
+
+    std::vector<char *> envp;
+    for (auto & e : env_store)
+        envp.push_back((char *)e.c_str());
+    envp.push_back(nullptr);
+
+    const char * argv[] = {job.bin.c_str(), "-8", "-H", "-q", job.uri.c_str(), nullptr};
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+
+    pid_t pid;
+    int err = posix_spawn(&pid, job.bin.c_str(), &actions, nullptr,
+                          (char * const *)argv, envp.data());
+    posix_spawn_file_actions_destroy(&actions);
+    if (err)
+    {
+        error = std::string("cannot start audacious: ") + strerror(err);
+        return std::string();
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    std::string out_dir = dir + "/out";
+    int status = 0;
+
+    for (int tick = 0;; tick++)
+    {
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || (r < 0 && errno != EINTR))
+            break;
+
+        long long size = 0;
+        if (tick % 10 == 0)
+            render_output(out_dir, &size);
+
+        const char * why = nullptr;
+        if (server_closing)
+            why = "server is shutting down";
+        else if (std::chrono::steady_clock::now() - start >
+                 std::chrono::seconds(RENDER_TIMEOUT_S))
+            why = "render timed out (endless track?)";
+        else if (size > RENDER_MAX_BYTES)
+            why = "render is too long (endless track?)";
+
+        if (why)
+        {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            error = why;
+            return std::string();
+        }
+
+        usleep(100000);
+    }
+
+    long long size = 0;
+    std::string file = render_output(out_dir, &size);
+    if (file.empty() || size <= 0)
+    {
+        error = "nothing was rendered (unsupported or broken file?)";
+        return std::string();
+    }
+    return file;
+}
+
+/* главный поток: что рендерить */
+static Response render_resolve(const Request & req, RenderJob & job)
+{
+    if (has_param(req, "sserial") &&
+        int_param(req, "sserial", 0) != structure_serial.load())
+        return error_response(409, "playlist changed");
+
+    Playlist list;
+    if (!get_playlist(req, list))
+        return error_response(404, "no such playlist");
+
+    int entry = int_param(req, "entry", -1);
+    if (entry < 0 || entry >= list.n_entries())
+        return error_response(404, "no such entry");
+
+    String uri = list.entry_filename(entry);
+    if (!uri || strncmp(uri, "file://", 7))
+        return error_response(415, "not a local file");
+
+    job.uri = (const char *)uri;
+
+    /* имя: имя файла без расширения, для подтрека — с его номером */
+    std::string base = job.uri, sub;
+    size_t q = base.rfind('?');
+    if (q != std::string::npos && q + 1 < base.size() &&
+        base.find_first_not_of("0123456789", q + 1) == std::string::npos)
+    {
+        sub = " (" + base.substr(q + 1) + ")";
+        base.resize(q);
+    }
+    std::string name = display_name(base.c_str());
+    size_t dot = name.rfind('.');
+    if (dot != std::string::npos && dot > 0)
+        name.resize(dot);
+    if (name.empty())
+        name = "track";
+    job.name = name + sub + ".mp3";
+
+    job.bin = std::string(aud_get_path(AudPath::BinDir)) + "/audacious";
+    job.user_dir = aud_get_path(AudPath::UserDir);
+    job.bitrate = aud::clamp(aud_get_int(CFG, "render_bitrate"), 32, 320);
+    return Response();
+}
+
+static void render_sweep(bool all)
+{
+    std::vector<std::string> dirs;
+    {
+        std::lock_guard<std::mutex> lock(render_mutex);
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = render_results.begin(); it != render_results.end();)
+        {
+            if (all || now - it->second.made > std::chrono::seconds(RENDER_KEEP_S))
+            {
+                dirs.push_back(it->second.dir);
+                it = render_results.erase(it);
+            }
+            else
+                ++it;
+        }
+    }
+    for (auto & dir : dirs)
+        remove_tree(dir);
+}
+
+/* остатки от аварийно завершённого Audacious — старше часа */
+static void render_sweep_stale()
+{
+    std::string base = temp_base();
+    DIR * dir = opendir(base.c_str());
+    if (!dir)
+        return;
+    time_t now = time(nullptr);
+    while (struct dirent * e = readdir(dir))
+    {
+        if (strncmp(e->d_name, RENDER_PREFIX, sizeof RENDER_PREFIX - 1))
+            continue;
+        std::string path = base + "/" + e->d_name;
+        struct stat st;
+        if (lstat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode) &&
+            st.st_uid == getuid() && now - st.st_mtime > 3600)
+            remove_tree(path);
+    }
+    closedir(dir);
+}
+
+/* POST /api/render — выполняется в потоке соединения */
+static Response handle_render(const Request & req)
+{
+    if (!check_auth(req))
+        return error_response(401, "unauthorized");
+    if (req.method != "POST")
+        return error_response(405, "method not allowed");
+    if (!check_origin(req))
+        return error_response(403, "cross-origin request rejected");
+    if (!aud_get_bool(CFG, "download"))
+        return error_response(403, "downloads are disabled");
+
+    RenderJob job;
+    Response r = run_in_main([&req, &job] { return render_resolve(req, job); });
+    if (r.code != 200)
+        return r;
+
+    render_sweep(false);
+
+    {
+        std::lock_guard<std::mutex> lock(render_mutex);
+        if (render_jobs >= RENDER_MAX_JOBS)
+            return error_response(503, "busy");
+        render_jobs++;
+    }
+
+    std::string tmpl = temp_base() + "/" + RENDER_PREFIX + "XXXXXX";
+    std::vector<char> buf(tmpl.begin(), tmpl.end());
+    buf.push_back(0);
+
+    std::string dir, file, error;
+    if (mkdtemp(buf.data()))
+    {
+        dir = buf.data();
+        if (render_prepare(job, dir))
+            file = render_run(job, dir, error);
+        else
+            error = "cannot prepare render";
+    }
+    else
+        error = "cannot create temporary folder";
+
+    {
+        std::lock_guard<std::mutex> lock(render_mutex);
+        render_jobs--;
+    }
+
+    if (file.empty())
+    {
+        if (!dir.empty())
+            remove_tree(dir);
+        AUDERR("Рендеринг %s не удался: %s\n", job.uri.c_str(), error.c_str());
+        return error_response(500, error.c_str());
+    }
+
+    std::random_device rd;
+    char token[33];
+    snprintf(token, sizeof token, "%08x%08x%08x%08x", rd(), rd(), rd(), rd());
+
+    struct stat st;
+    long long size = stat(file.c_str(), &st) == 0 ? (long long)st.st_size : 0;
+
+    {
+        std::lock_guard<std::mutex> lock(render_mutex);
+        render_results[token] = {dir, file, job.name, std::chrono::steady_clock::now()};
+    }
+
+    std::string out = "{\"ok\":true,";
+    json_field(out, "token", token);
+    json_field(out, "name", job.name.c_str());
+    json_field(out, "size", size);
+    json_close(out, '}');
+
+    Response ok;
+    ok.body = std::move(out);
+    return ok;
+}
+
+/* GET /api/render_get?token=… — отдаёт готовый MP3 один раз */
+static bool serve_render_get(int fd, const Request & req, bool keep)
+{
+    if (!check_auth(req))
+        return send_response(fd, error_response(401, "unauthorized"), false, keep) && keep;
+
+    RenderResult result;
+    {
+        std::lock_guard<std::mutex> lock(render_mutex);
+        auto it = render_results.find(str_param(req, "token"));
+        if (it == render_results.end())
+            return send_response(fd, error_response(404, "no such render"),
+                                 false, keep) && keep;
+        result = it->second;
+        render_results.erase(it);
+    }
+
+    bool ok = send_file(fd, result.file, result.name, keep);
+    remove_tree(result.dir);
+    return ok;
 }
 
 static Response handle_request(const Request & req)
@@ -2181,6 +2687,18 @@ static void serve_connection(Connection * conn)
         if (req.path == "/api/download" && !head_only)
         {
             if (!serve_download(fd, req, keep))
+                break;
+            continue;
+        }
+        if (req.path == "/api/render_get" && !head_only)
+        {
+            if (!serve_render_get(fd, req, keep))
+                break;
+            continue;
+        }
+        if (req.path == "/api/render")
+        {
+            if (!send_response(fd, handle_render(req), head_only, keep) || !keep)
                 break;
             continue;
         }
@@ -2372,6 +2890,7 @@ bool WebRemote::init()
     /* Эффект включается не сразу, а когда заработает главный цикл: во время
      * init() Audacious ещё может загружать плагины. */
     stream_start(); /* без слушателей кодировщик простаивает */
+    render_sweep_stale();
     stream_init_timer.queue(stream_sync_tap);
     return true;
 }
@@ -2380,6 +2899,7 @@ void WebRemote::cleanup()
 {
     stream_init_timer.stop();
     server_stop();
+    render_sweep(true);
     undo_stack.clear();
     stream_stop();
     hook_dissociate("playlist update", playlist_update_cb);
