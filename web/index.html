@@ -67,9 +67,27 @@ svg { width: 22px; height: 22px; fill: currentColor; flex: none; }
 .spacer { flex: 1; }
 #volrow { display: flex; align-items: center; gap: 6px; color: var(--dim); }
 #volume { width: 110px; }
+#volmode { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--dim); cursor: pointer; }
+#volmode input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
+#volrow.local { color: var(--accent); }
+#volgroup { display: flex; align-items: center; gap: 10px; }
 input[type=range] { accent-color: var(--accent); min-width: 0; height: 24px; margin: 0; }
 #seek { flex: 1; }
 #removecur span, #listen span { font-size: 13px; }
+
+/* ---- эквалайзер ---- */
+#eq { background: var(--panel); border-bottom: 1px solid var(--line); padding: 10px 16px 12px; }
+#eqhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+#eqhead label { display: flex; align-items: center; gap: 6px; }
+#eqhead input { accent-color: var(--accent); width: 18px; height: 18px; }
+#eqpreset { font: inherit; color: inherit; background: var(--raised); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; max-width: 100%; }
+#eqreset span { font-size: 13px; }
+#eqbands { display: flex; justify-content: space-between; max-width: 640px; }
+#eqbands.off { opacity: .45; }
+.eqband { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 1; min-width: 0; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.eqband input { writing-mode: vertical-lr; direction: rtl; width: 24px; height: 120px; }
+.eqband.pre { margin-right: 10px; padding-right: 10px; border-right: 1px solid var(--line); }
+.eqband .val { color: var(--text); }
 
 /* ---- плейлисты ---- */
 #tabs {
@@ -163,13 +181,29 @@ body.drag #list { outline: 2px dashed var(--accent); outline-offset: -6px; }
     <button id="shuffle" title="Случайный порядок"></button>
     <button id="repeat" title="Повтор плейлиста"></button>
     <button id="repeatone" title="Повторять текущий трек"></button>
+    <button id="eqbtn" title="Эквалайзер"></button>
+    <button id="dlcur" hidden title="Скачать играющий трек"></button>
     <button id="removecur" class="danger" title="Удалить играющий трек из плейлиста"><span>Убрать текущий</span></button>
     <button id="listen" hidden title="Слушать звук плеера в этом браузере"><span>Слушать здесь</span></button>
     <span class="spacer"></span>
-    <label id="volrow" title="Громкость">
+    <span id="volgroup">
+    <label id="volmode" hidden title="Ползунок громкости управляет трансляцией в этом браузере, а не плеером">
+      <input id="vollocal" type="checkbox"><span>поток</span>
+    </label>
+    <label id="volrow" title="Громкость плеера">
       <input id="volume" type="range" min="0" max="100" value="0" aria-label="Громкость">
     </label>
+    </span>
   </div>
+</section>
+
+<section id="eq" hidden>
+  <div id="eqhead">
+    <label><input id="eqon" type="checkbox"> Эквалайзер включён</label>
+    <select id="eqpreset" aria-label="Предустановка"></select>
+    <button id="eqreset" title="Все полосы и предусиление в ноль"><span>Сброс</span></button>
+  </div>
+  <div id="eqbands"></div>
 </section>
 
 <nav id="tabs"></nav>
@@ -179,7 +213,7 @@ body.drag #list { outline: 2px dashed var(--accent); outline-offset: -6px; }
   <button id="locate" title="Показать текущий трек"><span>К текущему</span></button>
   <button id="pladd" title="Добавить файл, папку или адрес с компьютера, где работает Audacious"><span>Добавить</span></button>
   <button id="upload" hidden title="Загрузить файлы с этого устройства и добавить в плейлист"><span>Загрузить</span></button>
-  <input id="upfile" type="file" multiple hidden accept=".mp3,.wav,.flac,.xm,.s3m,.mod,.it,.ogg,.opus,.m4a">
+  <input id="upfile" type="file" multiple hidden>
   <button id="undo" hidden><span>Вернуть</span></button>
   <button id="plrename" title="Переименовать плейлист"></button>
   <button id="plclear" class="danger" title="Очистить плейлист"></button>
@@ -214,6 +248,8 @@ const ICONS = {
   note: 'M12 3v10.6A4 4 0 1 0 14 17V7h4V3z',
   undo: 'M12.5 8c-2.6 0-5 1-6.9 2.6L2 7v9h9l-3.6-3.6A8 8 0 0 1 20.1 16l2.4-.8A10.5 10.5 0 0 0 12.5 8z',
   upload: 'M9 16h6v-6h4l-7-7-7 7h4zm-4 2h14v2H5z',
+  download: 'M19 9h-4V3H9v6H5l7 7zM5 18h14v2H5z',
+  eq: 'M7 3h2v6H7zm0 10h2v8H7zM5 9h6v4H5zm10-6h2v10h-2zm0 14h2v4h-2zm-2-4h6v4h-6z',
   listen: 'M12 3a9 9 0 0 0-9 9v7a2 2 0 0 0 2 2h3v-8H5v-1a7 7 0 0 1 14 0v1h-3v8h3a2 2 0 0 0 2-2v-7a9 9 0 0 0-9-9z',
 };
 const icon = name => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${ICONS[name]}"/></svg>`;
@@ -236,6 +272,19 @@ let list = null;        // загруженный плейлист (ответ /
 let shown = [];         // номера записей, прошедших фильтр
 let loading = false;
 let seeking = false, volDragging = false;
+
+// Громкость трансляции — своя у каждого браузера (хранится в нём же) и не
+// зависит от громкости плеера. Галочка «поток» переключает, чем управляет ползунок.
+function stored(key, fallback) {
+  try { const v = localStorage.getItem(key); return v === null ? fallback : v; } catch (e) { return fallback; }
+}
+function store(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) {}
+}
+let streamVolume = Math.min(100, Math.max(0, +stored('streamVolume', 100) || 0));
+let volLocal = stored('volLocal', '0') === '1';
+// квадрат — чтобы середина ползунка звучала как «вполовину тише»
+function applyStreamVolume() { liveAudio.volume = (streamVolume / 100) ** 2; }
 let artKey = null;
 
 /* ---- сеть ---- */
@@ -378,12 +427,21 @@ function renderNow() {
   $('playpause').innerHTML = icon(status.state === 'playing' ? 'pause' : 'play');
   $('stop').disabled = !playing;
   $('removecur').disabled = !t;
+  $('dlcur').hidden = !status.download;
+  $('dlcur').disabled = !t;
   $('shuffle').classList.toggle('on', status.shuffle);
   $('repeat').classList.toggle('on', status.repeat);
   $('repeatone').classList.toggle('on', status.repeat_one);
-  if (!volDragging) $('volume').value = status.volume;
+  renderEq();
+  // галочка «поток» нужна только там, где есть что слушать
+  $('volmode').hidden = !status.stream && !wantListen;
+  const local = volLocal && !$('volmode').hidden;
+  $('volrow').classList.toggle('local', local);
+  $('volrow').title = local ? 'Громкость трансляции в этом браузере' : 'Громкость плеера';
+  if (!volDragging) $('volume').value = local ? streamVolume : status.volume;
   $('listen').hidden = !status.stream && !wantListen;
   $('upload').hidden = !status.upload;
+  if (status.upload && !formatsAsked) { formatsAsked = true; loadFormats(); }
   $('undo').hidden = !status.undo;
   $('undo').title = status.undo ? 'Вернуть удалённое: ' + status.undo_title : '';
   if (wantListen && !status.stream) setListening(false);
@@ -472,7 +530,7 @@ function renderRows(force) {
   const isPlaying = view === status.playing && status.state !== 'stopped';
   const first = Math.max(0, Math.floor(listEl.scrollTop / ROW) - 8);
   const last = Math.min(shown.length, Math.ceil((listEl.scrollTop + listEl.clientHeight) / ROW) + 8);
-  const key = [first, last, pos, isPlaying, shown.length].join();
+  const key = [first, last, pos, isPlaying, shown.length, status.download].join();
   if (!force && key === rowsKey) return;
   rowsKey = key;
 
@@ -491,6 +549,7 @@ function renderRows(force) {
       `<div class="text"><div class="t">${esc(e[0])}</div>${sub ? `<div class="a">${esc(sub)}</div>` : ''}</div>` +
       (e[4] ? `<span class="q" title="Место в очереди">${e[4]}</span>` : '') +
       `<span class="len">${e[3] ? fmtTime(e[3]) : ''}</span>` +
+      (status.download ? `<button data-act="download" title="Скачать файл">${icon('download')}</button>` : '') +
       `<button data-act="queue" title="В очередь / из очереди">${icon('queue')}</button>` +
       `<button data-act="remove" class="danger" title="Удалить из плейлиста">${icon('close')}</button>` +
       `</div>`;
@@ -508,6 +567,8 @@ rowsEl.addEventListener('click', async e => {
   const btn = e.target.closest('button');
   if (!btn)
     return plCmd('jump', {entry});
+  if (btn.dataset.act === 'download')
+    return download(view, entry, list.sserial);
   if (btn.dataset.act === 'queue')
     return plCmd('queue', {entry});
   if (btn.dataset.act === 'remove') {
@@ -554,6 +615,122 @@ setup('playpause', null, () => cmd('playpause'));
 setup('shuffle', 'shuffle', () => cmd('shuffle'));
 setup('repeat', 'repeat', () => cmd('repeat'));
 setup('repeatone', 'repeatone', () => cmd('repeat_one'));
+
+/* ---- эквалайзер ---- */
+// Значения — десятые доли дБ (см. сервер). Предустановки: свои из Audacious
+// (если сохранены) и несколько встроенных.
+const EQ_FREQS = ['31', '63', '125', '250', '500', '1k', '2k', '4k', '8k', '16k'];
+const EQ_BUILTIN = [
+  {name: 'Ровно', preamp: 0, bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]},
+  {name: 'Больше баса', preamp: -30, bands: [60, 50, 40, 20, 0, 0, 0, 0, 0, 0]},
+  {name: 'Больше верхов', preamp: -30, bands: [0, 0, 0, 0, 0, 10, 25, 40, 55, 60]},
+  {name: 'Бас и верха', preamp: -30, bands: [55, 40, 20, 0, -15, -15, 0, 20, 40, 55]},
+  {name: 'Голос', preamp: -20, bands: [-30, -20, -10, 10, 30, 40, 35, 20, 0, -10]},
+  {name: 'Рок', preamp: -30, bands: [45, 30, 10, -15, -25, -10, 15, 35, 50, 50]},
+  {name: 'Тихая громкость', preamp: -20, bands: [50, 40, 20, 0, -10, -10, 0, 15, 30, 40]},
+];
+let eqPresets = EQ_BUILTIN, eqDragging = false, eqLoaded = false;
+const fmtDb = t => (t > 0 ? '+' : t < 0 ? '−' : '') + (Math.abs(t) / 10).toFixed(1).replace('.', ',');
+
+$('eqbands').innerHTML = ['Пред.', ...EQ_FREQS].map((label, i) =>
+  `<label class="eqband${i ? '' : ' pre'}"><span class="val">0</span>` +
+  `<input type="range" min="-120" max="120" step="5" value="0" data-i="${i - 1}" aria-label="${i ? label + ' Гц' : 'Предусиление'}">` +
+  `<span>${label}</span></label>`).join('');
+const eqInputs = [...$('eqbands').querySelectorAll('input')];   // [0] — предусиление
+const eqShow = () => eqInputs.forEach(inp => inp.previousElementSibling.textContent = fmtDb(+inp.value));
+
+function renderEq() {
+  if (!status) return;
+  const eq = status.eq;
+  $('eqbtn').classList.toggle('on', eq.active);
+  if ($('eq').hidden) return;
+  $('eqon').checked = eq.active;
+  $('eqbands').classList.toggle('off', !eq.active);
+  if (eqDragging) return;
+  [eq.preamp, ...eq.bands].forEach((v, i) => eqInputs[i].value = v);
+  eqShow();
+  const match = eqPresets.findIndex(p => p.preamp === eq.preamp && p.bands.every((b, i) => b === eq.bands[i]));
+  $('eqpreset').value = match;
+}
+
+function fillPresets() {
+  $('eqpreset').innerHTML = '<option value="-1">Своя настройка</option>' +
+    eqPresets.map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join('');
+}
+fillPresets();
+
+// полосы отправляются не чаще десяти раз в секунду, пока тянут ползунок
+let eqTimer = null, eqPending = false;
+function sendEq() {
+  if (!eqPending) { eqTimer = null; return; }
+  eqPending = false;
+  api('eq', {preamp: eqInputs[0].value, bands: eqInputs.slice(1).map(i => i.value).join(',')}).catch(() => {});
+  eqTimer = setTimeout(sendEq, 100);
+}
+$('eqbands').addEventListener('input', () => {
+  eqDragging = true;
+  eqShow();
+  $('eqpreset').value = -1;
+  eqPending = true;
+  if (!eqTimer) sendEq();
+});
+$('eqbands').addEventListener('change', () => setTimeout(() => { eqDragging = false; poll(); }, 400));
+// двойной щелчок по ползунку возвращает его в ноль
+$('eqbands').addEventListener('dblclick', e => {
+  if (e.target.tagName !== 'INPUT') return;
+  e.target.value = 0;
+  e.target.dispatchEvent(new Event('input', {bubbles: true}));
+  e.target.dispatchEvent(new Event('change', {bubbles: true}));
+});
+
+$('eqon').addEventListener('change', e => cmd('eq', {active: e.target.checked ? 1 : 0}));
+$('eqpreset').addEventListener('change', e => {
+  const p = eqPresets[+e.target.value];
+  // выбор предустановки заодно включает эквалайзер — иначе её не слышно
+  if (p) cmd('eq', {active: 1, preamp: p.preamp, bands: p.bands.join(',')});
+});
+setup('eqreset', null, () => cmd('eq', {preamp: 0, bands: EQ_BUILTIN[0].bands.join(',')}));
+setup('eqbtn', 'eq', async () => {
+  $('eq').hidden = !$('eq').hidden;
+  if ($('eq').hidden) return;
+  renderEq();
+  renderRows();
+  if (eqLoaded) return;
+  eqLoaded = true;
+  try {
+    const own = (await api('eq_presets')).presets;
+    if (own.length) {
+      eqPresets = [...own, ...EQ_BUILTIN];
+      fillPresets();
+      renderEq();
+    }
+  } catch (e) { eqLoaded = false; }
+});
+/* ---- скачивание трека ---- */
+async function download(pl, entry, sserial) {
+  const query = 'download?' + new URLSearchParams({pl, entry, sserial});
+  try {
+    // сначала проверка: иначе при ошибке браузер сохранил бы её текст как файл
+    const info = await api(query + '&check=1');
+    const a = document.createElement('a');
+    a.href = 'api/' + query;
+    a.download = info.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    toast('Скачивается: ' + info.name);
+  } catch (e) {
+    const why = {409: 'плейлист изменился, повторите', 415: 'это не файл на диске (поток или адрес в сети)',
+                 404: 'файл недоступен', 403: 'скачивание выключено в настройках'}[e.code] || e.message;
+    toast('Не удалось скачать: ' + why, true);
+    if (e.code === 409) poll(true);
+  }
+}
+setup('dlcur', 'download', () => {
+  const t = status && status.track;
+  if (t) download(status.playing, t.entry, status.sserial);
+});
+
 setup('removecur', 'trash', async () => {
   const t = status && status.track;
   if (!t) return;
@@ -562,6 +739,13 @@ setup('removecur', 'trash', async () => {
     removedToast(t.title);
 });
 $('volrow').insertAdjacentHTML('afterbegin', icon('volume'));
+$('vollocal').checked = volLocal;
+$('vollocal').addEventListener('change', e => {
+  volLocal = e.target.checked;
+  store('volLocal', volLocal ? '1' : '0');
+  volDragging = false;
+  if (status) renderNow();
+});
 
 /* ---- трансляция звука в этот браузер ---- */
 
@@ -657,6 +841,7 @@ function createLivePlayer(url, onLost, a = new Audio()) {
  * переподключается сам, пока не получится. Элемент <audio> один на всё
  * время — запущенному по нажатию элементу браузер разрешает играть снова. */
 const liveAudio = new Audio();
+applyStreamVolume();
 let wantListen = false, audio = null, retryTimer = null, lostShown = false;
 
 function connectStream() {
@@ -707,7 +892,15 @@ setup('plrename', 'edit', () => {
 setup('undo', 'undo', undo);
 
 /* ---- загрузка файлов с этого устройства ---- */
-const UPLOAD_EXTS = ['mp3', 'wav', 'flac', 'xm', 's3m', 'mod', 'it', 'ogg', 'opus', 'm4a'];
+// Разрешённые расширения сообщает сервер: это форматы, которые умеет Audacious,
+// либо список из настроек плагина. Пока список не получен, проверяет только сервер.
+let uploadExts = null;
+async function loadFormats() {
+  try {
+    uploadExts = (await api('formats')).exts;
+    $('upfile').accept = uploadExts.map(e => '.' + e).join(',');
+  } catch (e) {}
+}
 let uploading = false;
 
 function uploadOne(file, pl, onProgress) {
@@ -729,10 +922,12 @@ function uploadOne(file, pl, onProgress) {
 
 async function uploadFiles(files) {
   if (uploading) return toast('Дождитесь окончания текущей загрузки', true);
-  const good = files.filter(f => UPLOAD_EXTS.includes(f.name.split('.').pop().toLowerCase()));
+  await loadFormats();
+  const good = files.filter(f => !uploadExts || uploadExts.includes(f.name.split('.').pop().toLowerCase()));
   const skipped = files.length - good.length;
   if (!good.length)
-    return toast('Можно загружать только: ' + UPLOAD_EXTS.join(', '), true);
+    return toast('Этот формат загружать нельзя. Разрешены: ' + uploadExts.slice(0, 40).join(', ') +
+      (uploadExts.length > 40 ? ' и ещё ' + (uploadExts.length - 40) : ''), true);
 
   uploading = true;
   const pl = view, el = $('toast');
@@ -762,6 +957,7 @@ async function uploadFiles(files) {
 }
 
 setup('upload', 'upload', () => $('upfile').click());
+let formatsAsked = false;
 $('upfile').addEventListener('change', e => {
   const files = [...e.target.files];
   e.target.value = '';                // чтобы тот же файл можно было выбрать снова
@@ -824,6 +1020,12 @@ function sendVolume() {
 }
 volEl.addEventListener('input', () => {
   volDragging = true;
+  if ($('volrow').classList.contains('local')) {
+    streamVolume = +volEl.value;
+    store('streamVolume', streamVolume);
+    applyStreamVolume();
+    return;
+  }
   volPending = volEl.value;
   if (!volTimer) sendVolume();
 });
@@ -842,7 +1044,8 @@ document.addEventListener('keydown', e => {
 /* ---- запуск ---- */
 setInterval(() => { if (!document.hidden) poll(); }, 1000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
-poll();
+// адрес с #eq открывает страницу сразу с эквалайзером
+poll().then(() => { if (location.hash === '#eq') $('eqbtn').click(); });
 </script>
 </body>
 </html>

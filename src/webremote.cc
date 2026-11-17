@@ -10,6 +10,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -35,6 +36,7 @@
 
 #include <libaudcore/audstrings.h>
 #include <libaudcore/drct.h>
+#include <libaudcore/equalizer.h>
 #include <libaudcore/hook.h>
 #include <libaudcore/mainloop.h>
 #include <libaudcore/playlist.h>
@@ -90,7 +92,9 @@ const char * const WebRemote::defaults[] = {"port",   "8421", "remote",
                                             "FALSE",  "password", "",
                                             "stream", "FALSE", "stream_bitrate",
                                             "192",    "upload", "TRUE",
-                                            "upload_dir", "", nullptr};
+                                            "download", "TRUE",
+                                            "upload_dir", "", "upload_exts", "",
+                                            nullptr};
 
 const PreferencesWidget WebRemote::widgets[] = {
     WidgetSpin("Порт:", WidgetInt(CFG, "port", config_changed),
@@ -108,13 +112,19 @@ const PreferencesWidget WebRemote::widgets[] = {
     WidgetLabel("На странице появится кнопка «Слушать здесь». Поток также\n"
                 "доступен плеерам по адресу /stream.mp3. Новый битрейт\n"
                 "применяется со следующего трека."),
+    WidgetCheck("Разрешить скачивание треков со страницы",
+                WidgetBool(CFG, "download")),
     WidgetCheck("Разрешить загрузку файлов со страницы",
                 WidgetBool(CFG, "upload")),
     WidgetFileEntry("Папка для загруженных файлов:",
                     WidgetString(CFG, "upload_dir"), {FileSelectMode::Folder},
                     WIDGET_CHILD),
+    WidgetEntry("Разрешённые расширения:", WidgetString(CFG, "upload_exts"),
+                {false}, WIDGET_CHILD),
     WidgetLabel("Если папка не выбрана, файлы сохраняются в\n"
-                "~/Music/Audacious Web.")};
+                "~/Music/Audacious Web. Расширения перечисляются через\n"
+                "пробел или запятую (mp3, flac, xm); пустая строка — все\n"
+                "форматы, которые умеют включённые модули ввода Audacious.")};
 
 const PluginPreferences WebRemote::prefs = {{widgets}};
 
@@ -516,6 +526,8 @@ static Response api_undo()
     return r;
 }
 
+static void eq_json(std::string & out, double preamp, const float * bands);
+
 static Response api_status()
 {
     std::string out = "{";
@@ -539,6 +551,13 @@ static Response api_status()
     json_field(out, "playing", Playlist::playing_playlist().index());
     json_field(out, "stream", stream_available());
     json_field(out, "upload", aud_get_bool(CFG, "upload"));
+    json_field(out, "download", aud_get_bool(CFG, "download"));
+    json_key(out, "eq");
+    out += '{';
+    json_field(out, "active", aud_get_bool(nullptr, "equalizer_active"));
+    eq_json(out, aud_get_double(nullptr, "equalizer_preamp"), nullptr);
+    json_close(out, '}');
+    out += ',';
     json_field(out, "undo", (int)undo_stack.size());
     if (!undo_stack.empty())
         json_field(out, "undo_title", undo_stack.back().title.c_str());
@@ -648,6 +667,57 @@ static Response api_playlist(const Request & req)
         out += ',';
         out += std::to_string(have_queue ? list.queue_find_entry(i) + 1 : 0);
         out += "],";
+    }
+    json_close(out, ']');
+    out += '}';
+
+    Response r;
+    r.body = std::move(out);
+    return r;
+}
+
+/* --- эквалайзер --- */
+
+/* Усиление передаётся целым числом десятых долей дБ (-35 = -3,5 дБ):
+ * печать и разбор дробных чисел зависят от локали (в русской — запятая),
+ * а JSON и адрес запроса требуют точку. */
+static int eq_tenths(double db) { return (int)lround(db * 10); }
+
+static double eq_db(int tenths)
+{
+    return aud::clamp(tenths, -AUD_EQ_MAX_GAIN * 10, AUD_EQ_MAX_GAIN * 10) / 10.0;
+}
+
+/* дописывает "preamp":…,"bands":[…]; bands == nullptr — текущие полосы */
+static void eq_json(std::string & out, double preamp, const float * bands)
+{
+    double current[AUD_EQ_NBANDS];
+    if (!bands)
+        aud_eq_get_bands(current);
+
+    json_field(out, "preamp", eq_tenths(preamp));
+    json_key(out, "bands");
+    out += '[';
+    for (int i = 0; i < AUD_EQ_NBANDS; i++)
+    {
+        out += std::to_string(eq_tenths(bands ? bands[i] : current[i]));
+        out += ',';
+    }
+    json_close(out, ']');
+    out += ',';
+}
+
+/* предустановки, сохранённые пользователем в самом Audacious */
+static Response api_eq_presets()
+{
+    std::string out = "{\"presets\":[";
+    for (const EqualizerPreset & preset : aud_eq_read_presets("eq.preset"))
+    {
+        out += '{';
+        json_field(out, "name", safe(preset.name));
+        eq_json(out, preset.preamp, preset.bands);
+        json_close(out, '}');
+        out += ',';
     }
     json_close(out, ']');
     out += '}';
@@ -786,6 +856,39 @@ static Response api_command(const std::string & action, const Request & req)
                          one && aud_get_bool(CFG, "repeat_before_one"));
         }
     }
+    else if (action == "eq")
+    {
+        /* можно передать любое сочетание: active, preamp, bands (все десять
+         * через запятую) или band + value (одна полоса) */
+        if (has_param(req, "active"))
+            aud_set_bool(nullptr, "equalizer_active", int_param(req, "active", 0));
+        if (has_param(req, "preamp"))
+            aud_set_double(nullptr, "equalizer_preamp",
+                           eq_db(int_param(req, "preamp", 0)));
+        if (has_param(req, "bands"))
+        {
+            double bands[AUD_EQ_NBANDS];
+            const char * p = str_param(req, "bands");
+            for (int i = 0; i < AUD_EQ_NBANDS; i++)
+            {
+                char * end;
+                long value = strtol(p, &end, 10);
+                if (end == p || (*end != ',' && *end) ||
+                    (!*end && i < AUD_EQ_NBANDS - 1))
+                    return error_response(400, "bad bands");
+                bands[i] = eq_db(value);
+                p = *end ? end + 1 : end;
+            }
+            aud_eq_set_bands(bands);
+        }
+        if (has_param(req, "band"))
+        {
+            int band = int_param(req, "band", -1);
+            if (band < 0 || band >= AUD_EQ_NBANDS || !has_param(req, "value"))
+                return error_response(400, "bad band");
+            aud_eq_set_band(band, eq_db(int_param(req, "value", 0)));
+        }
+    }
     else if (action == "undo")
         return api_undo();
     else if (action == "remove_current")
@@ -896,6 +999,82 @@ static Response api_command(const std::string & action, const Request & req)
     return ok_response();
 }
 
+/* --- форматы, разрешённые для загрузки --- */
+
+static std::mutex ext_mutex;
+static std::vector<std::string> ext_cache; /* в нижнем регистре, по алфавиту */
+
+/* Обновляет список расширений: либо заданный в настройках, либо всё, что
+ * зарегистрировали включённые модули ввода Audacious. Главный поток. */
+static void refresh_exts()
+{
+    std::vector<std::string> exts;
+    auto add = [&exts](std::string ext) {
+        for (char & c : ext)
+            if (c >= 'A' && c <= 'Z')
+                c += 'a' - 'A';
+        if (!ext.empty() && ext.find('/') == std::string::npos)
+            exts.push_back(ext);
+    };
+
+    String custom = aud_get_str(CFG, "upload_exts");
+    std::string list = custom ? (const char *)custom : "";
+
+    if (list.find_first_not_of(" ,;.") != std::string::npos)
+    {
+        size_t pos = 0;
+        while ((pos = list.find_first_not_of(" ,;.", pos)) != std::string::npos)
+        {
+            size_t end = list.find_first_of(" ,;", pos);
+            if (end == std::string::npos)
+                end = list.size();
+            add(list.substr(pos, end - pos));
+            pos = end;
+        }
+    }
+    else
+    {
+        for (PluginHandle * handle : aud_plugin_list(PluginType::Input))
+        {
+            if (!aud_plugin_get_enabled(handle))
+                continue;
+            auto plugin = (const InputPlugin *)aud_plugin_get_header(handle);
+            if (!plugin)
+                continue;
+            auto ext = plugin->input_info.keys[InputKey::Ext];
+            for (; ext && *ext; ext++)
+                add(*ext);
+        }
+    }
+
+    std::sort(exts.begin(), exts.end());
+    exts.erase(std::unique(exts.begin(), exts.end()), exts.end());
+
+    std::lock_guard<std::mutex> lock(ext_mutex);
+    ext_cache.swap(exts);
+}
+
+static Response api_formats()
+{
+    refresh_exts();
+
+    std::string out = "{\"exts\":[";
+    {
+        std::lock_guard<std::mutex> lock(ext_mutex);
+        for (const std::string & ext : ext_cache)
+        {
+            json_str(out, ext.c_str());
+            out += ',';
+        }
+    }
+    json_close(out, ']');
+    out += '}';
+
+    Response r;
+    r.body = std::move(out);
+    return r;
+}
+
 static Response handle_api(const Request & req)
 {
     std::string action = req.path.substr(5); /* после "/api/" */
@@ -908,6 +1087,10 @@ static Response handle_api(const Request & req)
             return api_playlist(req);
         if (action == "art")
             return api_art();
+        if (action == "eq_presets")
+            return api_eq_presets();
+        if (action == "formats")
+            return api_formats();
         return error_response(404, "not found");
     }
 
@@ -1572,11 +1755,9 @@ static bool check_origin(const Request & req)
 /* Страница присылает файл телом POST-запроса /api/upload?name=…&pl=N.
  * Файл сохраняется в папку загрузок и добавляется в плейлист. Имя файла
  * приходит от клиента, поэтому из него берётся только последняя часть пути,
- * а расширение должно быть из списка звуковых форматов: записать что-то за
- * пределы папки или положить туда произвольный файл нельзя. */
-
-static const char * const upload_exts[] = {"mp3", "wav", "flac", "xm", "s3m",
-                                           "mod", "it",  "ogg",  "opus", "m4a"};
+ * а расширение должно быть из списка разрешённых (см. refresh_exts):
+ * записать что-то за пределы папки или положить туда произвольный файл
+ * нельзя. */
 
 static std::string upload_dir()
 {
@@ -1632,9 +1813,9 @@ static std::string upload_name(const std::string & raw)
         if (c >= 'A' && c <= 'Z')
             c += 'a' - 'A';
 
-    for (const char * allowed : upload_exts)
-        if (ext == allowed)
-            return name;
+    std::lock_guard<std::mutex> lock(ext_mutex);
+    if (std::binary_search(ext_cache.begin(), ext_cache.end(), ext))
+        return name;
     return std::string();
 }
 
@@ -1678,8 +1859,16 @@ static Response handle_upload(int fd, const Request & req, std::string & pending
         error = error_response(403, "uploads are disabled");
     else if (!req.body_len)
         error = error_response(400, "empty file");
-    else if ((name = upload_name(str_param(req, "name"))).empty())
-        error = error_response(415, "unsupported file type");
+    else
+    {
+        /* список форматов мог измениться: включили модуль, поменяли настройку */
+        run_in_main([] {
+            refresh_exts();
+            return Response();
+        });
+        if ((name = upload_name(str_param(req, "name"))).empty())
+            error = error_response(415, "unsupported file type");
+    }
 
     if (error.code != 200)
     {
@@ -1775,6 +1964,134 @@ static Response handle_upload(int fd, const Request & req, std::string & pending
     });
 }
 
+/* ------------------------------------------------------------------------ */
+/* Скачивание трека                                                          */
+/* ------------------------------------------------------------------------ */
+
+/* GET /api/download?pl=N&entry=M отдаёт файл записи плейлиста. Отдать можно
+ * только то, что стоит в плейлисте, — произвольный путь указать нельзя.
+ * С параметром check=1 файл не передаётся: страница сначала убеждается,
+ * что скачивание возможно, и только потом запускает его в браузере. */
+
+/* главный поток: путь к файлу записи в теле ответа либо ошибка */
+static Response download_resolve(const Request & req)
+{
+    if (has_param(req, "sserial") &&
+        int_param(req, "sserial", 0) != structure_serial.load())
+        return error_response(409, "playlist changed");
+
+    Playlist list;
+    if (!get_playlist(req, list))
+        return error_response(404, "no such playlist");
+
+    int entry = int_param(req, "entry", -1);
+    if (entry < 0 || entry >= list.n_entries())
+        return error_response(404, "no such entry");
+
+    String uri_str = list.entry_filename(entry);
+    std::string uri = uri_str ? (const char *)uri_str : "";
+    if (uri.compare(0, 7, "file://"))
+        return error_response(415, "not a local file");
+
+    /* у дорожек внутри одного файла (cue, модули) адрес кончается на ?N */
+    size_t q = uri.rfind('?');
+    if (q != std::string::npos &&
+        uri.find_first_not_of("0123456789", q + 1) == std::string::npos)
+        uri.resize(q);
+
+    StringBuf path = uri_to_filename(uri.c_str());
+    if (!path)
+        return error_response(415, "not a local file");
+
+    Response r;
+    r.body = (const char *)path;
+    return r;
+}
+
+/* возвращает false, если соединение нужно закрыть */
+static bool serve_download(int fd, const Request & req, bool keep)
+{
+    Response r;
+    if (!check_auth(req))
+        r = error_response(401, "unauthorized");
+    else if (req.method != "GET")
+        r = error_response(405, "method not allowed");
+    else if (!aud_get_bool(CFG, "download"))
+        r = error_response(403, "downloads are disabled");
+    else
+        r = run_in_main([req] { return download_resolve(req); });
+
+    if (r.code != 200)
+        return send_response(fd, r, false, keep) && keep;
+
+    std::string path = r.body;
+    int in = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (in < 0 || fstat(in, &st) < 0 || !S_ISREG(st.st_mode))
+    {
+        if (in >= 0)
+            close(in);
+        return send_response(fd, error_response(404, "file is not available"),
+                             false, keep) && keep;
+    }
+
+    size_t slash = path.rfind('/');
+    std::string name = path.substr(slash + 1);
+
+    if (has_param(req, "check"))
+    {
+        close(in);
+        std::string out = "{\"ok\":true,";
+        json_field(out, "name", name.c_str());
+        json_field(out, "size", (long long)st.st_size);
+        json_close(out, '}');
+        Response info;
+        info.body = std::move(out);
+        return send_response(fd, info, false, keep) && keep;
+    }
+
+    /* имя файла в заголовке — в кодировке RFC 5987, иначе кириллица ломается */
+    std::string encoded;
+    for (unsigned char c : name)
+    {
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || c == '.' || c == '-' || c == '_')
+            encoded += (char)c;
+        else
+        {
+            char buf[4];
+            snprintf(buf, sizeof buf, "%%%02X", c);
+            encoded += buf;
+        }
+    }
+
+    std::string head = "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: application/octet-stream\r\n"
+                       "Content-Length: " + std::to_string((long long)st.st_size) + "\r\n"
+                       "Content-Disposition: attachment; filename*=UTF-8''" + encoded + "\r\n"
+                       "Cache-Control: no-store\r\n"
+                       "X-Content-Type-Options: nosniff\r\n";
+    head += keep ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n";
+
+    bool ok = send_all(fd, head.data(), head.size());
+    long long left = st.st_size;
+    char chunk[65536];
+    while (ok && left > 0)
+    {
+        ssize_t n = read(in, chunk, std::min<long long>(left, sizeof chunk));
+        if (n <= 0)
+            ok = false; /* файл укоротили — обещанную длину уже не отдать */
+        else
+        {
+            ok = send_all(fd, chunk, n);
+            left -= n;
+        }
+    }
+
+    close(in);
+    return ok && keep;
+}
+
 static Response handle_request(const Request & req)
 {
     if (!check_auth(req))
@@ -1861,6 +2178,13 @@ static void serve_connection(Connection * conn)
         }
 
         bool keep = !wants_close(req) && !server_closing;
+        if (req.path == "/api/download" && !head_only)
+        {
+            if (!serve_download(fd, req, keep))
+                break;
+            continue;
+        }
+
         Response response;
         if (req.path == UPLOAD_PATH)
         {
